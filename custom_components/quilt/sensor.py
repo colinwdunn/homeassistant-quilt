@@ -130,11 +130,15 @@ class QuiltDialSensor(CoordinatorEntity[QuiltCoordinator], SensorEntity):
         super().__init__(coordinator)
         self.entity_description = description
         self._attr_unique_id = f"quilt_dial_{description.key}"
+        # Quilt's API names the dial after its serial ("Dial QD1-0B000VG2S");
+        # use a friendly device name and keep the serial as serial_number.
+        raw = coordinator.data["dial"].get("name") or ""
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, DIAL_DEVICE_ID)},
-            name=coordinator.data["dial"].get("name") or "Quilt Dial",
+            name="Quilt Dial",
             manufacturer="Quilt",
             model="Dial",
+            serial_number=raw.removeprefix("Dial ").strip() or None,
         )
 
     @property
