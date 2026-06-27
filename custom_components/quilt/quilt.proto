@@ -1,0 +1,136 @@
+syntax = "proto3";
+
+// Reconstructed (partial) schema for Quilt's HomeDatastoreService gRPC API.
+// Field numbers/types derived by reverse-engineering captured app traffic.
+// proto3 ignores unknown wire fields, so we only declare what the bridge uses.
+
+package core.protos.home_datastore;
+
+message Timestamp {
+  int64 seconds = 1;
+  int32 nanos = 2;
+}
+
+// ===================== READ =====================
+
+message GetHomeDatastoreSystemRequest {
+  string system_id = 1;
+}
+
+message HomeDatastoreSystem {
+  repeated Space spaces = 3;             // element with info.space_type==2 are rooms
+  repeated ComfortSetting comfort_settings = 13;
+  // other repeated collections (dials=7, indoor units=8, zones=9, ...) ignored
+}
+
+message Meta {
+  string id = 1;
+  Timestamp created = 2;
+  Timestamp updated = 3;
+  string system_id = 4;
+}
+
+message SpaceParent {
+  string parent_id = 2;                  // home/building space id
+}
+
+message SpaceInfo {
+  string name = 1;                       // "Primary Bedroom", "Living Room", ...
+  Timestamp updated = 3;
+  string timezone = 4;
+  uint32 space_type = 5;                 // 0 = building, 2 = room
+}
+
+message SpaceControl {
+  uint32 mode = 1;
+  float heat_setpoint = 2;               // °C
+  Timestamp updated = 3;
+  float cool_setpoint = 4;               // °C
+  float heat_setpoint2 = 5;              // °C (mirrors heat_setpoint)
+  uint32 f7 = 7;
+  uint32 f8 = 8;
+  string comfort_id = 9;                 // active comfort setting id
+}
+
+message SpaceSensor {
+  Timestamp ts = 1;
+  float humidity = 2;
+  float current_temp = 3;                // °C  <-- room temperature
+  uint32 valid = 4;
+}
+
+message Space {
+  Meta meta = 1;
+  SpaceParent parent = 2;
+  SpaceInfo info = 3;
+  SpaceControl control = 4;
+  SpaceSensor sensor = 5;
+}
+
+message ComfortValue {
+  Timestamp ts = 1;
+  string name = 2;                       // "Off","Eco","Sleep","Active"
+  uint32 f3 = 3;
+  float f4 = 4;
+  float heat_setpoint = 5;               // °C
+  float cool_setpoint = 6;               // °C
+  uint32 f7 = 7;
+  uint32 f8 = 8;
+  uint32 f9 = 9;
+  float f10 = 10;
+}
+
+message ComfortSpaceRef {
+  Timestamp ts = 1;
+  string space_id = 2;
+}
+
+message ComfortSetting {
+  Meta meta = 1;
+  ComfortValue value = 2;
+  ComfortSpaceRef space_ref = 3;
+}
+
+// ===================== WRITES =====================
+
+message Ref {
+  string id = 1;
+  Timestamp updated = 2;                 // concurrency token (object's updated_at)
+  string system_id = 4;
+}
+
+message ComfortUpdate {
+  Ref ref = 1;
+  ComfortValue value = 2;
+}
+
+message UpdateComfortSettingRequest {
+  ComfortUpdate update = 1;
+}
+
+message SpaceUpdateValue {
+  uint32 mode = 1;
+  float heat_setpoint = 2;
+  Timestamp updated = 3;
+  float cool_setpoint = 4;
+  float heat_setpoint2 = 5;
+  uint32 f8 = 8;
+  string comfort_id = 9;
+}
+
+message SpaceUpdate {
+  Ref ref = 1;
+  SpaceUpdateValue value = 4;
+}
+
+message UpdateSpaceRequest {
+  SpaceUpdate update = 1;
+}
+
+message UpdateResponse {}                  // responses parsed leniently
+
+service HomeDatastoreService {
+  rpc GetHomeDatastoreSystem(GetHomeDatastoreSystemRequest) returns (HomeDatastoreSystem);
+  rpc UpdateComfortSetting(UpdateComfortSettingRequest) returns (UpdateResponse);
+  rpc UpdateSpace(UpdateSpaceRequest) returns (UpdateResponse);
+}

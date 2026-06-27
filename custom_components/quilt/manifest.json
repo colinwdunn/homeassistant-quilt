@@ -1,0 +1,12 @@
+{
+  "domain": "quilt",
+  "name": "Quilt",
+  "version": "0.1.0",
+  "documentation": "https://github.com/colinwdunn/homeassistant-quilt",
+  "issue_tracker": "https://github.com/colinwdunn/homeassistant-quilt/issues",
+  "codeowners": ["@colinwdunn"],
+  "config_flow": true,
+  "iot_class": "cloud_polling",
+  "integration_type": "hub",
+  "requirements": ["grpcio>=1.60.0"]
+}
