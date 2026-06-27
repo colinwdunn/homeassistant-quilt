@@ -7,7 +7,11 @@ from homeassistant.core import HomeAssistant
 
 from .coordinator import QuiltCoordinator
 
-PLATFORMS: list[Platform] = [Platform.CLIMATE]
+PLATFORMS: list[Platform] = [
+    Platform.CLIMATE,
+    Platform.BINARY_SENSOR,
+    Platform.SENSOR,
+]
 
 type QuiltConfigEntry = ConfigEntry[QuiltCoordinator]
 

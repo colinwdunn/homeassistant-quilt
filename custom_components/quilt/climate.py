@@ -39,7 +39,7 @@ async def async_setup_entry(
     """Set up Quilt climate entities."""
     coordinator: QuiltCoordinator = entry.runtime_data
     async_add_entities(
-        QuiltClimate(coordinator, room_id) for room_id in coordinator.data
+        QuiltClimate(coordinator, room_id) for room_id in coordinator.data["rooms"]
     )
 
 
@@ -53,6 +53,7 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE
         | ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
+        | ClimateEntityFeature.PRESET_MODE
         | ClimateEntityFeature.TURN_ON
         | ClimateEntityFeature.TURN_OFF
     )
@@ -69,6 +70,10 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
         self._desired_cool = 24.0
         self._hold_until = 0.0
         self._ingest()
+        # Comfort presets minus "Off" (handled by HVACMode.OFF), e.g. Eco/Sleep/Active.
+        self._attr_preset_modes = [
+            name for name in self.room.get("presets", {}) if name.lower() != "off"
+        ]
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, room_id)},
             name=self.room.get("name"),
@@ -79,7 +84,7 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
     # --- helpers ---------------------------------------------------------
     @property
     def room(self) -> dict:
-        return self.coordinator.data[self._room_id]
+        return self.coordinator.data["rooms"][self._room_id]
 
     def _held(self) -> bool:
         return time.monotonic() < self._hold_until
@@ -143,6 +148,17 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
     def current_humidity(self) -> int | None:
         hum = self.room.get("humidity")
         return int(hum) if hum else None
+
+    @property
+    def preset_mode(self) -> str | None:
+        room = self.room
+        if not room["on"]:
+            return None
+        cid = room.get("active_comfort_id")
+        for name, preset in room.get("presets", {}).items():
+            if preset["id"] == cid:
+                return name
+        return None
 
     @property
     def target_temperature(self) -> float | None:
@@ -209,6 +225,14 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
             await self.coordinator.async_request_refresh()
         else:
             self.async_write_ha_state()
+
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        self._hold()
+        await self.hass.async_add_executor_job(
+            self.coordinator.client.set_preset, self._room_id, preset_mode
+        )
+        self._hold()
+        await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self) -> None:
         await self.async_set_hvac_mode(HVACMode.OFF)

@@ -15,8 +15,8 @@ from .const import CONF_REFRESH_TOKEN, CONF_SYSTEM_ID, DEFAULT_SCAN_INTERVAL, DO
 _LOGGER = logging.getLogger(__name__)
 
 
-class QuiltCoordinator(DataUpdateCoordinator[dict[str, dict]]):
-    """Polls Quilt's cloud and exposes rooms keyed by id."""
+class QuiltCoordinator(DataUpdateCoordinator[dict]):
+    """Polls Quilt's cloud and exposes {"rooms": {id: room}, "dial": {...}}."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(
@@ -29,12 +29,11 @@ class QuiltCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         auth = CognitoAuth(entry.data[CONF_REFRESH_TOKEN])
         self.client = QuiltClient(auth, entry.data[CONF_SYSTEM_ID])
 
-    async def _async_update_data(self) -> dict[str, dict]:
+    async def _async_update_data(self) -> dict:
         try:
-            rooms = await self.hass.async_add_executor_job(self.client.get_rooms)
+            return await self.hass.async_add_executor_job(self.client.get_system)
         except QuiltAuthError as err:
             # A revoked/expired refresh token needs the user to re-login.
             if "revoked" in str(err).lower() or "NotAuthorized" in str(err):
                 raise ConfigEntryAuthFailed(str(err)) from err
             raise UpdateFailed(str(err)) from err
-        return {room["id"]: room for room in rooms}
