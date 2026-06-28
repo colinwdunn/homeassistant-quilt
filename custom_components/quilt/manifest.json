@@ -1,7 +1,7 @@
 {
   "domain": "quilt",
   "name": "Quilt",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "documentation": "https://github.com/colinwdunn/homeassistant-quilt",
   "issue_tracker": "https://github.com/colinwdunn/homeassistant-quilt/issues",
   "codeowners": ["@colinwdunn"],
