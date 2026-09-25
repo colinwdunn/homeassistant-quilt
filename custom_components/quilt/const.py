@@ -7,8 +7,13 @@ CONF_REFRESH_TOKEN = "refresh_token"
 CONF_SYSTEM_ID = "system_id"
 CONF_EMAIL = "email"
 
-# Polling
+# Polling: a fallback now that changes arrive over the push stream.
 DEFAULT_SCAN_INTERVAL = 60  # seconds
+CONF_SCAN_INTERVAL = "scan_interval"
+MIN_SCAN_INTERVAL = 10  # seconds
+MAX_SCAN_INTERVAL = 3600  # seconds
+# Shortest gap between on-demand refreshes (after writes and pushed changes).
+REFRESH_COOLDOWN = 2.0  # seconds
 
 # HVAC setpoint bounds (mirrors the Homebridge accessory clamps)
 HEAT_MIN = 8.0

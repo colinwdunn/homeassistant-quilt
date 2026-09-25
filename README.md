@@ -32,6 +32,12 @@ client) and exposes each room as a `climate` entity.
   Assistant runtime; regenerate from `custom_components/quilt/quilt.proto` if
   upgrading.
 - Cloud-dependent (talks to Quilt's cloud); no local API exists.
+- Updates are pushed: the integration keeps Quilt's notifier stream open (the
+  same one the Quilt app uses), so a change made in the app or on a Dial reaches
+  Home Assistant within about a second, and room temperature, humidity and
+  occupancy stay current. A poll every 60 seconds remains as a fallback (change
+  it under the integration's **Configure** options), and the stream reconnects
+  on its own if it drops.
 - Mode comes from Quilt's own mode field, so a mode set in the Quilt app or on a
   Dial shows up in Home Assistant as that mode. Versions before 0.3.0 inferred
   the mode from the setpoints and wrote every mode as Cool.

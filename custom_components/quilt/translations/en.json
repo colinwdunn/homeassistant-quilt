@@ -1,0 +1,40 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Quilt",
+        "description": "Quilt will email you a one-time code.",
+        "data": {
+          "email": "Quilt account email"
+        }
+      },
+      "code": {
+        "title": "Quilt",
+        "description": "Enter the code from Quilt's email and your Quilt system ID.",
+        "data": {
+          "code": "One-time code",
+          "system_id": "Quilt system ID"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Couldn't reach Quilt. Check the email address and try again.",
+      "invalid_auth": "That code didn't work, or the system ID is wrong.",
+      "no_rooms": "No rooms were found for this system ID."
+    },
+    "abort": {
+      "already_configured": "This Quilt system is already set up."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Quilt options",
+        "description": "Changes arrive within about a second over Quilt's push stream. This poll is a fallback, and it also picks up preset and schedule edits and the Dial's own sensors.",
+        "data": {
+          "scan_interval": "Fallback poll interval"
+        }
+      }
+    }
+  }
+}
