@@ -2,8 +2,8 @@
 
 Custom integration that brings [Quilt](https://www.quilt.com) heat pumps into
 Home Assistant as native `climate` entities (Quilt ships no HomeKit/Matter/local
-API). Each Quilt room becomes a thermostat with OFF/HEAT/COOL/HEAT_COOL control,
-current temperature, and setpoints.
+API). Each Quilt room becomes a thermostat with the same modes as the Quilt app
+(Off, Cool, Heat, Heat/Cool, Fan, Dry), current temperature, and setpoints.
 
 Built by reverse-engineering Quilt's cloud API (AWS Cognito passwordless auth +
 the `HomeDatastoreService` gRPC API), ported from the author's `homebridge-quilt`
@@ -32,3 +32,6 @@ client) and exposes each room as a `climate` entity.
   Assistant runtime; regenerate from `custom_components/quilt/quilt.proto` if
   upgrading.
 - Cloud-dependent (talks to Quilt's cloud); no local API exists.
+- Mode comes from Quilt's own mode field, so a mode set in the Quilt app or on a
+  Dial shows up in Home Assistant as that mode. Versions before 0.3.0 inferred
+  the mode from the setpoints and wrote every mode as Cool.

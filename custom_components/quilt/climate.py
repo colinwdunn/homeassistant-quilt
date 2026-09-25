@@ -1,10 +1,13 @@
 """Climate platform for Quilt heat-pump rooms."""
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 import time
 from typing import Any
 
 from homeassistant.components.climate import (
+    ATTR_HVAC_MODE,
     ClimateEntity,
     ClimateEntityFeature,
     HVACAction,
@@ -12,8 +15,10 @@ from homeassistant.components.climate import (
 )
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import api
@@ -27,10 +32,15 @@ from .const import (
 )
 from .coordinator import QuiltCoordinator
 
-# Quilt "Off"-preset sentinels: a very low heat / very high cool threshold
-# disables that side, which is how we express heat-only / cool-only.
-HEAT_DISABLED = api.HEAT_DISABLED  # 8.0
-COOL_DISABLED = api.COOL_DISABLED  # 40.0
+QUILT_TO_HA = {
+    api.MODE_OFF: HVACMode.OFF,
+    api.MODE_COOL: HVACMode.COOL,
+    api.MODE_HEAT: HVACMode.HEAT,
+    api.MODE_HEAT_COOL: HVACMode.HEAT_COOL,
+    api.MODE_FAN: HVACMode.FAN_ONLY,
+    api.MODE_DRY: HVACMode.DRY,
+}
+HA_TO_QUILT = {ha: quilt for quilt, ha in QUILT_TO_HA.items()}
 
 
 async def async_setup_entry(
@@ -44,12 +54,19 @@ async def async_setup_entry(
 
 
 class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
-    """A Quilt room exposed as a heat/cool/auto thermostat."""
+    """A Quilt room exposed as a thermostat with Quilt's own modes."""
 
     _attr_has_entity_name = True
     _attr_name = None
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
-    _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL, HVACMode.HEAT_COOL]
+    _attr_hvac_modes = [
+        HVACMode.OFF,
+        HVACMode.COOL,
+        HVACMode.HEAT,
+        HVACMode.HEAT_COOL,
+        HVACMode.FAN_ONLY,
+        HVACMode.DRY,
+    ]
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE
         | ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
@@ -69,6 +86,12 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
         self._desired_heat = 20.0
         self._desired_cool = 24.0
         self._hold_until = 0.0
+        # What we last wrote, shown until the first poll after the hold.
+        self._optimistic: dict | None = None
+        self._unsub_hold: Callable[[], None] | None = None
+        # HomeKit sends a mode change and a temperature change as concurrent
+        # calls; each write is a read-modify-write of the room, so serialize them.
+        self._write_lock = asyncio.Lock()
         self._ingest()
         # Comfort presets minus "Off" (handled by HVACMode.OFF), e.g. Eco/Sleep/Active.
         self._attr_preset_modes = [
@@ -84,7 +107,10 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
     # --- helpers ---------------------------------------------------------
     @property
     def room(self) -> dict:
-        return self.coordinator.data["rooms"][self._room_id]
+        base = self.coordinator.data["rooms"][self._room_id]
+        if self._optimistic:
+            return {**base, **self._optimistic}
+        return base
 
     def _held(self) -> bool:
         return time.monotonic() < self._hold_until
@@ -100,6 +126,7 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
         ap = room.get("presets", {}).get("Active")
         s_heat = room["heat_setpoint"] if room["on"] else (ap["heat"] if ap else room["heat_setpoint"])
         s_cool = room["cool_setpoint"] if room["on"] else (ap["cool"] if ap else room["cool_setpoint"])
+        # The Off preset parks the setpoints at unusable extremes; keep the last real ones.
         if s_heat is not None and s_heat > 9:
             self._desired_heat = s_heat
         if s_cool is not None and s_cool < 39:
@@ -107,36 +134,69 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
+        if not self._held():
+            self._optimistic = None
         self._ingest()
         super()._handle_coordinator_update()
 
+    async def _write(self, func: Callable[[], int]) -> int:
+        """Run one blocking write; the hold keeps a mid-write poll from resetting setpoints."""
+        async with self._write_lock:
+            self._hold()
+            return await self.hass.async_add_executor_job(func)
+
+    async def _applied(self, mode: int, **extra: Any) -> None:
+        """Show a successful write immediately; refresh from the cloud once the hold ends."""
+        self._optimistic = {"mode": mode, "on": mode != api.MODE_OFF, **extra}
+        self._hold()
+        if self._unsub_hold:
+            self._unsub_hold()
+        self._unsub_hold = async_call_later(self.hass, WRITE_HOLD_SECONDS, self._hold_expired)
+        self.async_write_ha_state()
+        await self.coordinator.async_request_refresh()
+
+    @callback
+    def _hold_expired(self, _now: Any) -> None:
+        self._unsub_hold = None
+        self.hass.async_create_task(self.coordinator.async_request_refresh())
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_hold:
+            self._unsub_hold()
+            self._unsub_hold = None
+        await super().async_will_remove_from_hass()
+
+    def _clamp(self, mode: HVACMode | None) -> None:
+        self._desired_heat = min(max(self._desired_heat, HEAT_MIN), HEAT_MAX)
+        self._desired_cool = min(max(self._desired_cool, COOL_MIN), COOL_MAX)
+        if self._desired_heat > self._desired_cool:
+            if mode == HVACMode.HEAT:
+                self._desired_cool = self._desired_heat
+            else:
+                self._desired_heat = self._desired_cool
+
     # --- state -----------------------------------------------------------
     @property
-    def hvac_mode(self) -> HVACMode:
-        room = self.room
-        if not room["on"]:
-            return HVACMode.OFF
-        cool = room["cool_setpoint"]
-        heat = room["heat_setpoint"]
-        if cool is not None and cool >= 39:
-            return HVACMode.HEAT
-        if heat is not None and heat <= 9:
-            return HVACMode.COOL
-        return HVACMode.HEAT_COOL
+    def hvac_mode(self) -> HVACMode | None:
+        return QUILT_TO_HA.get(self.room["mode"])
 
     @property
     def hvac_action(self) -> HVACAction:
-        room = self.room
-        if not room["on"]:
+        mode = self.hvac_mode
+        if mode == HVACMode.OFF or not self.room["on"]:
             return HVACAction.OFF
-        t = room["current_temp"]
+        if mode is None:
+            return HVACAction.IDLE
+        if mode == HVACMode.FAN_ONLY:
+            return HVACAction.FAN
+        if mode == HVACMode.DRY:
+            return HVACAction.DRYING
+        t = self.room["current_temp"]
         if t is None:
             return HVACAction.IDLE
-        heat = room["heat_setpoint"]
-        cool = room["cool_setpoint"]
-        if cool is not None and cool < 39 and t > cool + 0.2:
+        if mode in (HVACMode.COOL, HVACMode.HEAT_COOL) and t > self._desired_cool + 0.2:
             return HVACAction.COOLING
-        if heat is not None and heat > 9 and t < heat - 0.2:
+        if mode in (HVACMode.HEAT, HVACMode.HEAT_COOL) and t < self._desired_heat - 0.2:
             return HVACAction.HEATING
         return HVACAction.IDLE
 
@@ -165,9 +225,9 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
         mode = self.hvac_mode
         if mode == HVACMode.HEAT:
             return self._desired_heat
-        if mode == HVACMode.COOL:
+        if mode in (HVACMode.COOL, HVACMode.DRY):
             return self._desired_cool
-        return None  # HEAT_COOL / OFF use the range attributes
+        return None  # HEAT_COOL uses the range attributes; FAN_ONLY/OFF have no target
 
     @property
     def target_temperature_high(self) -> float | None:
@@ -178,64 +238,63 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
         return min(max(self._desired_heat, HEAT_MIN), HEAT_MAX)
 
     # --- commands --------------------------------------------------------
-    def _effective(self, mode: HVACMode) -> tuple[float, float]:
-        if mode == HVACMode.HEAT:
-            return self._desired_heat, COOL_DISABLED
-        if mode == HVACMode.COOL:
-            return HEAT_DISABLED, self._desired_cool
-        return self._desired_heat, self._desired_cool  # HEAT_COOL
+    async def _write_mode(self, hvac_mode: HVACMode) -> None:
+        if hvac_mode == HVACMode.OFF:
+            mode = await self._write(
+                lambda: self.coordinator.client.set_active(self._room_id, False)
+            )
+            await self._applied(mode)
+            return
+        self._clamp(hvac_mode)
+        heat, cool = self._desired_heat, self._desired_cool
+        mode = await self._write(
+            lambda: self.coordinator.client.set_setpoints(
+                self._room_id, heat=heat, cool=cool, mode=HA_TO_QUILT[hvac_mode]
+            )
+        )
+        await self._applied(mode, heat_setpoint=heat, cool_setpoint=cool)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        self._hold()
-        if hvac_mode == HVACMode.OFF:
-            await self.hass.async_add_executor_job(
-                self.coordinator.client.set_active, self._room_id, False
-            )
-        else:
-            heat, cool = self._effective(hvac_mode)
-            await self.hass.async_add_executor_job(
-                lambda: self.coordinator.client.set_setpoints(
-                    self._room_id, heat=heat, cool=cool
-                )
-            )
-        self._hold()
-        await self.coordinator.async_request_refresh()
+        await self._write_mode(hvac_mode)
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
+        requested = kwargs.get(ATTR_HVAC_MODE)
+        if requested is not None and requested not in HA_TO_QUILT:
+            raise ServiceValidationError(f"Quilt has no {requested} mode")
+        mode = requested or self.hvac_mode
         if (high := kwargs.get("target_temp_high")) is not None:
             self._desired_cool = high
         if (low := kwargs.get("target_temp_low")) is not None:
             self._desired_heat = low
         if (temp := kwargs.get(ATTR_TEMPERATURE)) is not None:
-            mode = self.hvac_mode
-            if mode == HVACMode.COOL:
-                self._desired_cool = temp
-            else:
+            if mode == HVACMode.HEAT:
                 self._desired_heat = temp
-        self._hold()
-        # Apply only when on; when off, Quilt applies on next activation.
-        if self.room["on"]:
-            heat, cool = self._effective(self.hvac_mode)
-            await self.hass.async_add_executor_job(
-                lambda: self.coordinator.client.set_setpoints(
-                    self._room_id, heat=heat, cool=cool
-                )
-            )
-            self._hold()
-            await self.coordinator.async_request_refresh()
-        else:
-            self.async_write_ha_state()
+            else:
+                self._desired_cool = temp
+        if requested is not None:
+            await self._write_mode(requested)
+            return
+        # No mode given: the room keeps whatever mode Quilt reports at write
+        # time, and an off room only stores the setpoints for its next turn-on.
+        self._clamp(mode)
+        heat, cool = self._desired_heat, self._desired_cool
+        written = await self._write(
+            lambda: self.coordinator.client.set_setpoints(self._room_id, heat=heat, cool=cool)
+        )
+        await self._applied(written, heat_setpoint=heat, cool_setpoint=cool)
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
-        self._hold()
-        await self.hass.async_add_executor_job(
-            self.coordinator.client.set_preset, self._room_id, preset_mode
+        mode = await self._write(
+            lambda: self.coordinator.client.set_preset(self._room_id, preset_mode)
         )
-        self._hold()
-        await self.coordinator.async_request_refresh()
+        preset = self.room.get("presets", {}).get(preset_mode) or {}
+        await self._applied(mode, active_comfort_id=preset.get("id"))
 
     async def async_turn_off(self) -> None:
-        await self.async_set_hvac_mode(HVACMode.OFF)
+        await self._write_mode(HVACMode.OFF)
 
     async def async_turn_on(self) -> None:
-        await self.async_set_hvac_mode(HVACMode.HEAT_COOL)
+        mode = await self._write(
+            lambda: self.coordinator.client.set_active(self._room_id, True)
+        )
+        await self._applied(mode)
