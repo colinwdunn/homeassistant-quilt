@@ -26,9 +26,14 @@ CLIENT_ID = "6lef74vtc8p7pgu47nmqubd9vn"
 USER_POOL_ID = "us-west-2_mP0zkCEzn"
 GRPC_HOST = "api.prod.quilt.cloud:443"
 
-# Space.control.mode values.
+# Space.control.mode is the room's HVAC mode. Codes 6 and 7 have not been seen.
 MODE_OFF = 1
-MODE_ACTIVE = 2
+MODE_COOL = 2
+MODE_HEAT = 3
+MODE_HEAT_COOL = 4
+MODE_FAN = 5
+MODE_DRY = 8
+KNOWN_MODES = frozenset({MODE_OFF, MODE_COOL, MODE_HEAT, MODE_HEAT_COOL, MODE_FAN, MODE_DRY})
 
 # Quilt "Off" preset sentinels: a very low heat / very high cool threshold
 # disables that side, which is how we express heat-only / cool-only.
@@ -260,6 +265,7 @@ class QuiltClient:
                     "value": c.value,  # keep the ComfortValue message for writes
                     "heat": c.value.heat_setpoint,
                     "cool": c.value.cool_setpoint,
+                    "mode": c.value.f8,
                 }
             mode = s.control.mode if s.HasField("control") else MODE_OFF
             rooms.append({
@@ -271,7 +277,10 @@ class QuiltClient:
                 "humidity": s.sensor.humidity if s.HasField("sensor") else None,
                 "mode": mode,
                 "on": mode != MODE_OFF,
-                "heat_setpoint": s.control.heat_setpoint if s.HasField("control") else None,
+                # Field 5 holds the heat setpoint in every mode; field 2 tracks
+                # whichever setpoint the current mode targets.
+                "heat_setpoint": (s.control.heat_setpoint2 or s.control.heat_setpoint)
+                if s.HasField("control") else None,
                 "cool_setpoint": s.control.cool_setpoint if s.HasField("control") else None,
                 "active_comfort_id": s.control.comfort_id if s.HasField("control") else None,
                 "presets": presets,
@@ -336,49 +345,83 @@ class QuiltClient:
             ref=pb.Ref(id=room["id"], updated=room["space_updated"],
                        system_id=self._system_id),
             value=pb.SpaceUpdateValue(
-                mode=mode, heat_setpoint=heat, cool_setpoint=cool,
-                heat_setpoint2=heat, f8=2, comfort_id=comfort_id, updated=_now_ts()),
+                mode=mode,
+                heat_setpoint=0.0 if mode == MODE_OFF else heat if mode == MODE_HEAT else cool,
+                cool_setpoint=cool, heat_setpoint2=heat, f8=2,
+                comfort_id=comfort_id, updated=_now_ts()),
         )
 
-    def set_active(self, room_id: str, on: bool):
-        """Turn a room on (Active preset) or off (Off preset)."""
+    @staticmethod
+    def resume_mode(room: dict) -> int:
+        """The mode to use when turning a room on: its last active mode, else Cool."""
+        ap = room["presets"].get("Active")
+        mode = ap["mode"] if ap else None
+        return mode if mode in KNOWN_MODES and mode != MODE_OFF else MODE_COOL
+
+    def set_active(self, room_id: str, on: bool) -> int:
+        """Turn a room off (Off preset) or back on in its last mode. Returns the mode."""
         room = self._fresh_room(room_id)
         preset = room["presets"].get("Active" if on else "Off")
         if not preset:
             raise QuiltAuthError(f"no {'Active' if on else 'Off'} preset for {room['name']}")
-        upd = self._space_update(room, mode=MODE_ACTIVE if on else MODE_OFF,
-                                 heat=preset["heat"], cool=preset["cool"],
+        mode = self.resume_mode(room) if on else MODE_OFF
+        upd = self._space_update(room, mode=mode, heat=preset["heat"], cool=preset["cool"],
                                  comfort_id=preset["id"])
-        return self._stub.UpdateSpace(pb.UpdateSpaceRequest(update=upd),
-                                      metadata=self._meta(), timeout=20)
+        self._stub.UpdateSpace(pb.UpdateSpaceRequest(update=upd),
+                               metadata=self._meta(), timeout=20)
+        return mode
 
-    def set_preset(self, room_id: str, preset_name: str):
-        """Apply a named comfort preset (Active/Eco/Sleep/Off) to a room."""
+    def set_preset(self, room_id: str, preset_name: str) -> int:
+        """Apply a named comfort preset (Active/Eco/Sleep/Off), keeping the room's mode.
+
+        Returns the mode written.
+        """
         room = self._fresh_room(room_id)
         preset = room["presets"].get(preset_name)
         if not preset:
             raise QuiltAuthError(f"no {preset_name} preset for {room['name']}")
-        on = preset_name.lower() != "off"
-        upd = self._space_update(room, mode=MODE_ACTIVE if on else MODE_OFF,
-                                 heat=preset["heat"], cool=preset["cool"],
+        if preset_name.lower() == "off":
+            mode = MODE_OFF
+        elif room["on"] and room["mode"] in KNOWN_MODES:
+            mode = room["mode"]
+        else:
+            mode = self.resume_mode(room)
+        upd = self._space_update(room, mode=mode, heat=preset["heat"], cool=preset["cool"],
                                  comfort_id=preset["id"])
-        return self._stub.UpdateSpace(pb.UpdateSpaceRequest(update=upd),
-                                      metadata=self._meta(), timeout=20)
+        self._stub.UpdateSpace(pb.UpdateSpaceRequest(update=upd),
+                               metadata=self._meta(), timeout=20)
+        return mode
 
     def set_setpoints(self, room_id: str, *, heat: float | None = None,
-                      cool: float | None = None):
-        """Update the room's Active preset setpoints, then apply (activating it)."""
+                      cool: float | None = None, mode: int | None = None) -> int:
+        """Store setpoints (and mode) in the Active preset and apply them.
+
+        With no mode given, a room that is on keeps its current mode and a room
+        that is off stays off (the setpoints apply on the next turn-on). Returns
+        the room's mode after the write.
+        """
         room = self._fresh_room(room_id)
         ap = room["presets"].get("Active")
         if not ap:
             raise QuiltAuthError(f"no Active preset for {room['name']}")
+        if mode is not None and (mode not in KNOWN_MODES or mode == MODE_OFF):
+            raise ValueError(f"not an active Quilt mode: {mode}")
+        apply = mode is not None or room["on"]
+        if mode is None:
+            mode = room["mode"] if room["on"] else MODE_OFF
         new_heat = heat if heat is not None else ap["heat"]
         new_cool = cool if cool is not None else ap["cool"]
 
+        # The Quilt app keeps the Active preset's f8 equal to the room mode (and
+        # f9 at 3 for Fan, 4 otherwise); schedules re-apply the preset, so a
+        # stale f8 would switch the mode back.
         value = pb.ComfortValue()
         value.CopyFrom(ap["value"])
         value.heat_setpoint = new_heat
         value.cool_setpoint = new_cool
+        if mode != MODE_OFF:
+            value.f8 = mode
+            value.f9 = 3 if mode == MODE_FAN else 4
         value.ts.CopyFrom(_now_ts())
         comfort_upd = pb.ComfortUpdate(
             ref=pb.Ref(id=ap["id"], updated=ap["meta_updated"], system_id=self._system_id),
@@ -386,9 +429,34 @@ class QuiltClient:
         self._stub.UpdateComfortSetting(
             pb.UpdateComfortSettingRequest(update=comfort_upd),
             metadata=self._meta(), timeout=20)
+        if not apply:
+            return MODE_OFF
 
         room2 = self._fresh_room(room_id)  # fresh concurrency token
-        upd = self._space_update(room2, mode=MODE_ACTIVE, heat=new_heat, cool=new_cool,
+        upd = self._space_update(room2, mode=mode, heat=new_heat, cool=new_cool,
                                  comfort_id=ap["id"])
-        return self._stub.UpdateSpace(pb.UpdateSpaceRequest(update=upd),
-                                      metadata=self._meta(), timeout=20)
+        try:
+            self._stub.UpdateSpace(pb.UpdateSpaceRequest(update=upd),
+                                   metadata=self._meta(), timeout=20)
+        except Exception:
+            self._restore_preset(room2, ap["value"])
+            raise
+        return mode
+
+    def _restore_preset(self, room: dict, original: pb.ComfortValue) -> None:
+        """Best effort: put the Active preset back after a failed UpdateSpace."""
+        ap = room["presets"].get("Active")
+        if not ap:
+            return
+        value = pb.ComfortValue()
+        value.CopyFrom(original)
+        value.ts.CopyFrom(_now_ts())
+        try:
+            self._stub.UpdateComfortSetting(
+                pb.UpdateComfortSettingRequest(update=pb.ComfortUpdate(
+                    ref=pb.Ref(id=ap["id"], updated=ap["meta_updated"],
+                               system_id=self._system_id),
+                    value=value)),
+                metadata=self._meta(), timeout=20)
+        except Exception:  # noqa: BLE001 - the caller re-raises the original error
+            pass
