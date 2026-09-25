@@ -5,16 +5,41 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
+from homeassistant.core import callback
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+)
 
 from . import api
-from .const import CONF_EMAIL, CONF_REFRESH_TOKEN, CONF_SYSTEM_ID, DOMAIN
+from .const import (
+    CONF_EMAIL,
+    CONF_REFRESH_TOKEN,
+    CONF_SCAN_INTERVAL,
+    CONF_SYSTEM_ID,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+    MAX_SCAN_INTERVAL,
+    MIN_SCAN_INTERVAL,
+)
 
 
 class QuiltConfigFlow(ConfigFlow, domain=DOMAIN):
     """Email -> emailed code -> store refresh token + system id."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        return QuiltOptionsFlow()
 
     def __init__(self) -> None:
         self._email: str | None = None
@@ -82,4 +107,33 @@ class QuiltConfigFlow(ConfigFlow, domain=DOMAIN):
                 }
             ),
             errors=errors,
+        )
+
+
+class QuiltOptionsFlow(OptionsFlow):
+    """Fallback poll interval (changes themselves arrive over the push stream)."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            return self.async_create_entry(
+                data={CONF_SCAN_INTERVAL: int(user_input[CONF_SCAN_INTERVAL])}
+            )
+        current = self.config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_SCAN_INTERVAL, default=current): NumberSelector(
+                        NumberSelectorConfig(
+                            min=MIN_SCAN_INTERVAL,
+                            max=MAX_SCAN_INTERVAL,
+                            step=1,
+                            unit_of_measurement="s",
+                            mode=NumberSelectorMode.BOX,
+                        )
+                    )
+                }
+            ),
         )

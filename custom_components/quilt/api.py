@@ -9,8 +9,13 @@ and reauth.py (passwordless CUSTOM_AUTH email-code login).
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 import json
+import logging
+import math
+import random
 import struct
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -45,6 +50,11 @@ _COGNITO_URL = f"https://cognito-idp.{REGION}.amazonaws.com/"
 
 class QuiltAuthError(Exception):
     """Raised when Cognito auth fails (bad/expired/revoked token or code)."""
+
+
+def is_revoked(err: Exception) -> bool:
+    """True when the refresh token itself was rejected (the user must log in again)."""
+    return "revoked" in str(err).lower() or "NotAuthorized" in str(err)
 
 
 def _cognito(target: str, body: dict, *, region: str = REGION) -> dict:
@@ -147,6 +157,74 @@ def _first(node, *path):
     return node
 
 
+def _finite(value):
+    return value if isinstance(value, float) and math.isfinite(value) else None
+
+
+def _space_state(s) -> dict:
+    """The live fields of a Space message, shared by full reads and pushes."""
+    state: dict = {}
+    if s.HasField("control"):
+        state["mode"] = s.control.mode
+        state["on"] = s.control.mode != MODE_OFF
+        state["active_comfort_id"] = s.control.comfort_id
+        # Field 5 holds the heat setpoint in every mode; field 2 tracks
+        # whichever setpoint the current mode targets.
+        heat = _finite(s.control.heat_setpoint2 or s.control.heat_setpoint)
+        cool = _finite(s.control.cool_setpoint)
+        if heat is not None:
+            state["heat_setpoint"] = heat
+        if cool is not None:
+            state["cool_setpoint"] = cool
+    if s.HasField("sensor"):
+        temp = _finite(s.sensor.current_temp)
+        if temp is not None:
+            state["current_temp"] = temp
+    return state
+
+
+def _unit_state(unit: dict) -> tuple[str | None, dict]:
+    """(space id, live fields) from one decoded indoor unit (head)."""
+    state: dict = {}
+    occ = _first(unit, 7, 2)  # presence flag: 2 occupied, 1 vacant
+    if occ is not None:
+        state["occupied"] = occ == 2
+    hum = _finite(_first(unit, 5, 11))  # head humidity (% RH)
+    if hum is not None:
+        state["humidity"] = round(hum)
+    return _first(unit, 2, 2), state  # first ref = space id
+
+
+def _iter_fields(buf: bytes):
+    """Yield (field, wire_type, value) with length-delimited values as raw bytes."""
+    i, n = 0, len(buf)
+    while i < n:
+        tag, i = _read_varint(buf, i)
+        field, wt = tag >> 3, tag & 7
+        if wt == 0:
+            val, i = _read_varint(buf, i)
+        elif wt == 2:
+            ln, i = _read_varint(buf, i)
+            val = buf[i:i + ln]
+            i += ln
+        elif wt == 5:
+            val = buf[i:i + 4]
+            i += 4
+        elif wt == 1:
+            val = buf[i:i + 8]
+            i += 8
+        else:
+            return
+        yield field, wt, val
+
+
+def _raw_field(buf: bytes, field: int) -> bytes | None:
+    for f, wt, val in _iter_fields(buf):
+        if f == field and wt == 2:
+            return val
+    return None
+
+
 # ----------------------------------------------------------------------------
 # Passwordless email-code login (used by the config flow to mint a refresh token)
 # ----------------------------------------------------------------------------
@@ -188,8 +266,13 @@ class CognitoAuth:
         self._region = region
         self._id_token: str | None = None
         self._exp = 0
+        self._lock = threading.Lock()
 
     def id_token(self) -> str:
+        with self._lock:
+            return self._fresh_id_token()
+
+    def _fresh_id_token(self) -> str:
         now = time.time()
         if self._id_token and now < self._exp - 120:
             return self._id_token
@@ -267,26 +350,26 @@ class QuiltClient:
                     "cool": c.value.cool_setpoint,
                     "mode": c.value.f8,
                 }
-            mode = s.control.mode if s.HasField("control") else MODE_OFF
             rooms.append({
                 "id": s.meta.id,
                 "name": s.info.name,
                 "space_updated": pb.Timestamp(seconds=s.meta.updated.seconds,
                                               nanos=s.meta.updated.nanos),
-                "current_temp": s.sensor.current_temp if s.HasField("sensor") else None,
-                "humidity": s.sensor.humidity if s.HasField("sensor") else None,
-                "mode": mode,
-                "on": mode != MODE_OFF,
-                # Field 5 holds the heat setpoint in every mode; field 2 tracks
-                # whichever setpoint the current mode targets.
-                "heat_setpoint": (s.control.heat_setpoint2 or s.control.heat_setpoint)
-                if s.HasField("control") else None,
-                "cool_setpoint": s.control.cool_setpoint if s.HasField("control") else None,
-                "active_comfort_id": s.control.comfort_id if s.HasField("control") else None,
+                "current_temp": None,
+                # Only the indoor unit reports humidity; the space sensor's
+                # second field is not a humidity reading.
+                "humidity": None,
+                "mode": MODE_OFF,
+                "on": False,
+                "heat_setpoint": None,
+                "cool_setpoint": None,
+                "active_comfort_id": None,
+                **_space_state(s),
                 "presets": presets,
                 # Filled in by get_system() from the indoor-unit (head) telemetry.
                 "occupied": None,
                 "unit_serial": None,
+                "unit_id": None,
             })
         return rooms
 
@@ -303,18 +386,13 @@ class QuiltClient:
         extras = _decode(raw)
 
         for unit in extras.get(9, []):  # indoor units (one head per room)
-            try:
-                room = rooms.get(_first(unit, 2, 2))  # first ref = space id
-                if not room:
-                    continue
-                occ = _first(unit, 7, 2)  # presence flag: 2 occupied, 1 vacant
-                room["occupied"] = None if occ is None else occ == 2
-                hum = _first(unit, 5, 11)  # head humidity (% RH)
-                if hum is not None:
-                    room["humidity"] = round(hum)
-                room["unit_serial"] = _first(unit, 3, 1)
-            except (TypeError, ValueError, IndexError):
+            space_id, state = _unit_state(unit)
+            room = rooms.get(space_id)
+            if not room:
                 continue
+            room["unit_id"] = _first(unit, 1, 1)
+            room["unit_serial"] = _first(unit, 3, 1)
+            room.update(state)
 
         dial = None
         draw = (extras.get(11) or [None])[0]
@@ -460,3 +538,241 @@ class QuiltClient:
                 metadata=self._meta(), timeout=20)
         except Exception:  # noqa: BLE001 - the caller re-raises the original error
             pass
+
+
+# ----------------------------------------------------------------------------
+# NotifierService push stream
+# ----------------------------------------------------------------------------
+#
+# The Quilt app keeps a bidirectional NotifierService.Subscribe stream open and
+# the cloud pushes each subscribed object (topic "hds/<type>/<id>") whenever it
+# changes, plus a steady trickle of telemetry. Each data event carries the whole
+# object in the same shape as GetHomeDatastoreSystem, so it goes through the
+# same parsers.
+
+NOTIFIER_SUBSCRIBE = "/core.protos.notifier.NotifierService/Subscribe"
+CONTROL_TOPIC_APPENDED = 1
+CONTROL_RECONNECT_REQUEST = 5
+_LOGGER = logging.getLogger(__name__)
+
+
+def _varint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def _len_delimited(field: int, payload: bytes) -> bytes:
+    return _varint((field << 3) | 2) + _varint(len(payload)) + payload
+
+
+def subscribe_request(topics: list[str]) -> bytes:
+    """SubscribeRequest{append: {subscriptions: [{topic}, ...]}}."""
+    subs = b"".join(_len_delimited(1, _len_delimited(1, t.encode())) for t in topics)
+    return _len_delimited(2, subs)
+
+
+def parse_notifier_frame(raw: bytes) -> list[dict]:
+    """Decode one Subscribe response into events.
+
+    Returns dicts of kind "space" (space_id + _space_state fields), "unit"
+    (space_id + _unit_state fields) or "control" (type + topics). Heartbeats
+    and anything unrecognised yield nothing.
+    """
+    events: list[dict] = []
+    try:
+        for f, wt, wrapper in _iter_fields(raw):
+            if f != 1 or wt != 2:
+                continue
+            for kind, kwt, body in _iter_fields(wrapper):
+                if kwt != 2:
+                    continue
+                if kind == 2:
+                    d = _decode(body)
+                    events.append({"kind": "control", "type": _first(d, 2),
+                                   "topics": d.get(1, [])})
+                elif kind == 1:
+                    events.extend(_data_events(body))
+    except Exception:  # noqa: BLE001 - a bad frame must never kill the stream
+        _LOGGER.debug("Unparseable Quilt notifier frame (%d bytes)", len(raw))
+    return events
+
+
+def _data_events(event: bytes) -> list[dict]:
+    any_msg = _raw_field(event, 2)
+    notification = _raw_field(any_msg, 2) if any_msg else None
+    diff = _raw_field(notification, 2) if notification else None
+    if not diff:
+        return []
+    events = []
+    obj = pb.HomeDatastoreSystem.FromString(diff)
+    for s in obj.spaces:
+        events.append({"kind": "space", "space_id": s.meta.id, **_space_state(s)})
+    for unit in _decode(diff).get(9, []):
+        space_id, state = _unit_state(unit)
+        if space_id:
+            events.append({"kind": "unit", "space_id": space_id, **state})
+    return events
+
+
+class NotifierStream:
+    """Keeps one NotifierService.Subscribe stream open on a background thread.
+
+    Reconnects with jittered backoff, on a Quilt RECONNECT_REQUEST, when the
+    stream goes silent (the cloud normally sends something every few seconds),
+    and when the topic list changes. Callbacks run on the stream thread.
+    """
+
+    SILENCE_TIMEOUT = 90.0
+    MAX_BACKOFF = 60.0
+    HEALTHY_AFTER = 30.0  # a stream this old counts as healthy, resetting backoff
+
+    def __init__(self, auth: CognitoAuth, topics: Callable[[], list[str]],
+                 on_events: Callable[[list[dict]], None],
+                 on_connect: Callable[[], None]) -> None:
+        self._auth = auth
+        self._topics = topics
+        self._on_events = on_events
+        self._on_connect = on_connect
+        self._stop = threading.Event()
+        self._call = None
+        self._subscribed: frozenset[str] = frozenset()
+        self._last_frame = 0.0
+        self._auth_warned = False
+        self._revoked = False
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="quilt-notifier", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        call = self._call
+        if call is not None:
+            call.cancel()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def resubscribe_if_changed(self, topics: list[str]) -> None:
+        """Restart the stream when the rooms/units to follow have changed."""
+        call = self._call
+        if call is not None and frozenset(topics) != self._subscribed:
+            call.cancel()
+
+    def _run(self) -> None:
+        backoff = 1.0
+        while not self._stop.is_set():
+            started = time.monotonic()
+            connected = self._stream_once()
+            if self._stop.is_set():
+                break
+            if self._revoked:
+                # The poll raises ConfigEntryAuthFailed; wait for the reload.
+                self._stop.wait()
+                break
+            if connected and time.monotonic() - started >= self.HEALTHY_AFTER:
+                backoff = 1.0
+            self._stop.wait(backoff * random.uniform(0.5, 1.5))
+            backoff = min(backoff * 2, self.MAX_BACKOFF)
+
+    def _stream_once(self) -> bool:
+        """Run one stream until it ends. Returns True if it connected."""
+        topics = self._topics()
+        if not topics:
+            return False
+        try:
+            token = self._auth.id_token()
+        except QuiltAuthError as err:
+            if is_revoked(err):
+                _LOGGER.warning("Quilt notifier stopped: Quilt rejected the login (%s)", err)
+                self._revoked = True
+            elif not self._auth_warned:
+                _LOGGER.warning("Quilt notifier can't refresh its login; retrying: %s", err)
+                self._auth_warned = True
+            return False
+        except (urllib.error.URLError, OSError) as err:
+            _LOGGER.debug("Quilt notifier can't reach Cognito: %s", err)
+            return False
+        self._auth_warned = False
+        if self._stop.is_set():
+            return False
+        done = threading.Event()
+        connected = False
+
+        def requests():
+            yield subscribe_request(topics)
+            # Hold the request side open; the stream ends only by cancel.
+            while not done.wait(5):
+                pass
+
+        channel = grpc.secure_channel(
+            GRPC_HOST, grpc.ssl_channel_credentials(),
+            options=[("grpc.keepalive_time_ms", 30_000),
+                     ("grpc.keepalive_timeout_ms", 10_000),
+                     ("grpc.keepalive_permit_without_calls", 1)],
+        )
+        watchdog = threading.Thread(target=self._watch, args=(done,), daemon=True)
+        call = None
+        try:
+            call = channel.stream_stream(NOTIFIER_SUBSCRIBE,
+                                         request_serializer=lambda b: b,
+                                         response_deserializer=lambda b: b)(
+                requests(), metadata=(("authorization", token),))
+            self._call = call
+            self._subscribed = frozenset(topics)
+            # stop() may have run before self._call was set; it can't see this call.
+            if self._stop.is_set():
+                return False
+            self._last_frame = time.monotonic()
+            watchdog.start()
+            for frame in call:
+                self._last_frame = time.monotonic()
+                data = []
+                reconnect = False
+                for ev in parse_notifier_frame(frame):
+                    if ev["kind"] != "control":
+                        data.append(ev)
+                    elif ev["type"] == CONTROL_TOPIC_APPENDED:
+                        pass
+                    elif ev["type"] == CONTROL_RECONNECT_REQUEST:
+                        reconnect = True
+                    elif ev["type"] is not None:
+                        _LOGGER.warning("Quilt notifier control event %s for %s",
+                                        ev["type"], ev["topics"])
+                    if not connected and (ev["kind"] != "control"
+                                          or ev["type"] == CONTROL_TOPIC_APPENDED):
+                        connected = True
+                        _LOGGER.debug("Quilt notifier subscribed to %d topics", len(topics))
+                        self._on_connect()
+                if data:
+                    self._on_events(data)
+                if reconnect:
+                    _LOGGER.debug("Quilt notifier asked us to reconnect")
+                    return connected
+        except grpc.RpcError as err:
+            if not self._stop.is_set():
+                _LOGGER.debug("Quilt notifier stream ended: %s", err.code())
+        except Exception:  # noqa: BLE001 - keep the thread alive; the poll still runs
+            _LOGGER.exception("Quilt notifier stream failed")
+        finally:
+            done.set()
+            self._call = None
+            if call is not None:
+                call.cancel()
+            channel.close()
+        return connected
+
+    def _watch(self, done: threading.Event) -> None:
+        while not done.wait(15):
+            if time.monotonic() - self._last_frame > self.SILENCE_TIMEOUT:
+                _LOGGER.debug("Quilt notifier silent for %.0fs; reconnecting",
+                              self.SILENCE_TIMEOUT)
+                call = self._call
+                if call is not None:
+                    call.cancel()
+                return
