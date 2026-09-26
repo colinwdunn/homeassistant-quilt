@@ -31,7 +31,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import QuiltCoordinator
-from .entity import QuiltEntity
+from .entity import QuiltEntity, room_device
 
 DIAL_DEVICE_ID = "dial"
 
@@ -110,7 +110,7 @@ class QuiltRoomHumidity(QuiltEntity, SensorEntity):
         super().__init__(coordinator)
         self._room_id = room_id
         self._attr_unique_id = f"quilt_{room_id}_humidity"
-        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, room_id)})
+        self._attr_device_info = room_device(coordinator, room_id)
 
     @property
     def native_value(self) -> int | None:
@@ -132,7 +132,7 @@ class QuiltRoomEnergy(QuiltEntity, SensorEntity):
         super().__init__(coordinator)
         self._room_id = room_id
         self._attr_unique_id = f"quilt_{room_id}_energy_today"
-        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, room_id)})
+        self._attr_device_info = room_device(coordinator, room_id)
 
     @property
     def available(self) -> bool:

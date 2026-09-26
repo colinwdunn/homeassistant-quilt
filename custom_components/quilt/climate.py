@@ -16,7 +16,6 @@ from homeassistant.components.climate import (
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ServiceValidationError
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_call_later
 
@@ -24,13 +23,12 @@ from . import api
 from .const import (
     COOL_MAX,
     COOL_MIN,
-    DOMAIN,
     HEAT_MAX,
     HEAT_MIN,
     WRITE_HOLD_SECONDS,
 )
 from .coordinator import QuiltCoordinator
-from .entity import QuiltEntity
+from .entity import QuiltEntity, room_device
 
 QUILT_TO_HA = {
     api.MODE_OFF: HVACMode.OFF,
@@ -117,12 +115,7 @@ class QuiltClimate(QuiltEntity, ClimateEntity):
         self._attr_preset_modes = [
             name for name in self.room.get("presets", {}) if name.lower() != "off"
         ]
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, room_id)},
-            name=self.room.get("name"),
-            manufacturer="Quilt",
-            model="Heat Pump",
-        )
+        self._attr_device_info = room_device(coordinator, room_id)
 
     # --- helpers ---------------------------------------------------------
     @property
@@ -263,12 +256,17 @@ class QuiltClimate(QuiltEntity, ClimateEntity):
         return min(max(self._desired_heat, HEAT_MIN), HEAT_MAX)
 
     # --- commands --------------------------------------------------------
+    def _preset_id(self, name: str) -> dict:
+        """active_comfort_id for the optimistic state after a write that applies `name`."""
+        preset = self.room.get("presets", {}).get(name)
+        return {"active_comfort_id": preset["id"]} if preset else {}
+
     async def _write_mode(self, hvac_mode: HVACMode) -> None:
         if hvac_mode == HVACMode.OFF:
             mode = await self._write(
                 lambda: self.coordinator.client.set_active(self._room_id, False)
             )
-            await self._applied(mode)
+            await self._applied(mode, **self._preset_id("Off"))
             return
         self._clamp(hvac_mode)
         heat, cool = self._desired_heat, self._desired_cool
@@ -277,7 +275,7 @@ class QuiltClimate(QuiltEntity, ClimateEntity):
                 self._room_id, heat=heat, cool=cool, mode=HA_TO_QUILT[hvac_mode]
             )
         )
-        await self._applied(mode, heat_setpoint=heat, cool_setpoint=cool)
+        await self._applied(mode, heat_setpoint=heat, cool_setpoint=cool, **self._preset_id("Active"))
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         await self._write_mode(hvac_mode)
@@ -306,7 +304,8 @@ class QuiltClimate(QuiltEntity, ClimateEntity):
         written = await self._write(
             lambda: self.coordinator.client.set_setpoints(self._room_id, heat=heat, cool=cool)
         )
-        await self._applied(written, heat_setpoint=heat, cool_setpoint=cool)
+        applied = self._preset_id("Active") if written != api.MODE_OFF else {}
+        await self._applied(written, heat_setpoint=heat, cool_setpoint=cool, **applied)
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         mode = await self._write(
@@ -319,7 +318,9 @@ class QuiltClimate(QuiltEntity, ClimateEntity):
         await self._write_mode(HVACMode.OFF)
 
     async def async_turn_on(self) -> None:
+        if self.room["on"]:
+            return  # already on: keep its mode and preset (e.g. Sleep or Eco)
         mode = await self._write(
             lambda: self.coordinator.client.set_active(self._room_id, True)
         )
-        await self._applied(mode)
+        await self._applied(mode, **self._preset_id("Active"))

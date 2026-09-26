@@ -101,10 +101,11 @@ def make_system() -> dict:
 class FakeStream:
     """Stands in for api.NotifierStream; tests push through the coordinator callbacks."""
 
-    def __init__(self, auth, topics, on_events, on_connect) -> None:
+    def __init__(self, auth, topics, on_events, on_connect, on_disconnect=None) -> None:
         self.topics_fn = topics
         self.on_events = on_events
         self.on_connect = on_connect
+        self.on_disconnect = on_disconnect
         self.healthy = False
         self.started = False
         self.stopped = False
@@ -136,6 +137,11 @@ def mock_client(system, energy):
     """Patch QuiltClient where the coordinator builds it. Each poll returns a deep copy."""
     client = MagicMock(name="QuiltClient")
     client.get_system.side_effect = lambda: copy.deepcopy(system)
+    # One bucket per room starting "now" (the coordinator asks until now + 1 h),
+    # so the whole value lands in the current local day.
+    client.get_energy.side_effect = lambda since, until: {
+        sid: [(int(until) - 3600, kwh)] for sid, kwh in energy.items()
+    }
     client.get_energy_today.side_effect = lambda since, until: dict(energy)
     client.set_active.side_effect = lambda room_id, on: api.MODE_COOL if on else api.MODE_OFF
     client.set_setpoints.side_effect = (

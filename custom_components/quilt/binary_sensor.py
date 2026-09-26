@@ -11,12 +11,10 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
 from .coordinator import QuiltCoordinator
-from .entity import QuiltEntity
+from .entity import QuiltEntity, room_device
 
 
 async def async_setup_entry(
@@ -42,7 +40,7 @@ class QuiltOccupancy(QuiltEntity, BinarySensorEntity):
         self._room_id = room_id
         self._attr_unique_id = f"quilt_{room_id}_occupancy"
         # Attach to the same device as the room's climate entity.
-        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, room_id)})
+        self._attr_device_info = room_device(coordinator, room_id)
 
     @property
     def is_on(self) -> bool | None:

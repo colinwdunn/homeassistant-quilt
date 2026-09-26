@@ -71,7 +71,8 @@ class QuiltCoordinator(DataUpdateCoordinator[dict]):
         auth = CognitoAuth(entry.data[CONF_REFRESH_TOKEN])
         self.client = QuiltClient(auth, entry.data[CONF_SYSTEM_ID])
         self._stream = NotifierStream(
-            auth, self._topics, self._events_from_thread, self._connected_from_thread
+            auth, self._topics, self._events_from_thread, self._connected_from_thread,
+            self._disconnected_from_thread,
         )
         # When each room last had a pushed value applied (time.monotonic()), so
         # a full read that started earlier can't roll it back.
@@ -84,7 +85,8 @@ class QuiltCoordinator(DataUpdateCoordinator[dict]):
         self.energy: dict[str, float] = {}
         self.energy_last_reset: datetime | None = None
         self._energy_attempt = float("-inf")
-        self._energy_inflight = False
+        self._energy_attempt_day: datetime | None = None
+        self._energy_task = None
         self._energy_warned = False
 
     @property
@@ -125,34 +127,57 @@ class QuiltCoordinator(DataUpdateCoordinator[dict]):
     # --- energy ----------------------------------------------------------
     @callback
     def _schedule_energy_refresh(self) -> None:
-        """Fetch today's energy in the background when due; never delays the poll."""
+        """Fetch today's energy in the background when due; never delays the poll.
+
+        Due every ENERGY_REFRESH_INTERVAL, and right away on the first poll of a
+        new local day (a failed attempt waits the interval before retrying).
+        """
         midnight = dt_util.start_of_local_day()
-        new_day = midnight != self.energy_last_reset
+        new_day = midnight != self._energy_attempt_day
         due = time.monotonic() - self._energy_attempt >= ENERGY_REFRESH_INTERVAL
-        if self._energy_inflight or not (new_day or due):
+        if (self._energy_task is not None and not self._energy_task.done()) or not (new_day or due):
             return
-        self._energy_inflight = True
         self._energy_attempt = time.monotonic()
-        self.entry.async_create_background_task(
+        self._energy_attempt_day = midnight
+        self._energy_task = self.entry.async_create_background_task(
             self.hass, self._async_refresh_energy(midnight), "quilt energy refresh"
         )
 
     async def _async_refresh_energy(self, midnight: datetime) -> None:
+        # On a new day, read from the previous reset so the finished day's final
+        # total can be recorded before the sensors restart from zero; otherwise
+        # whatever was used after the last read of the day would never be counted.
+        previous = self.energy_last_reset
+        since = previous if previous is not None and previous < midnight else midnight
         try:
-            totals = await self.hass.async_add_executor_job(
-                self.client.get_energy_today, midnight.timestamp(), time.time() + 3600
+            buckets = await self.hass.async_add_executor_job(
+                self.client.get_energy, since.timestamp(), time.time() + 3600
             )
         except Exception as err:  # noqa: BLE001 - energy is best-effort
             if not self._energy_warned:
                 _LOGGER.warning("Couldn't read Quilt energy use; will retry: %s", err)
                 self._energy_warned = True
             return
-        finally:
-            self._energy_inflight = False
         self._energy_warned = False
-        self.energy = totals
+        if since < midnight:
+            day_end = dt_util.start_of_local_day(since + timedelta(hours=26))
+            self.energy = {
+                sid: sum(k for start, k in b if since.timestamp() <= start < day_end.timestamp())
+                for sid, b in buckets.items()
+            }
+            self.async_update_listeners()  # final total, under the old last_reset
+        self.energy = {
+            sid: sum(k for start, k in b if start >= midnight.timestamp())
+            for sid, b in buckets.items()
+        }
         self.energy_last_reset = midnight
         self.async_update_listeners()
+
+    async def async_shutdown(self) -> None:
+        """Stop polling and any energy read before the client is closed."""
+        if self._energy_task is not None and not self._energy_task.done():
+            self._energy_task.cancel()
+        await super().async_shutdown()
 
     # --- push stream -----------------------------------------------------
     def start_push(self) -> None:
@@ -190,6 +215,18 @@ class QuiltCoordinator(DataUpdateCoordinator[dict]):
 
     def _connected_from_thread(self) -> None:
         self._call_soon(self._catch_up)
+        self._call_soon(self._push_health_changed)
+
+    def _disconnected_from_thread(self) -> None:
+        self._call_soon(self._push_health_changed)
+
+    @callback
+    def _push_health_changed(self) -> None:
+        # Entities stay available on a healthy stream even when polls fail, so
+        # re-check them when the stream comes or goes. (HA itself only notifies
+        # on the first of several failed polls.)
+        if not self.last_update_success:
+            self.async_update_listeners()
 
     @callback
     def _catch_up(self) -> None:

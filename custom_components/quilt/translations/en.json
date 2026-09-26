@@ -33,8 +33,9 @@
     },
     "error": {
       "cannot_connect": "Couldn't reach Quilt. Check the email address and try again.",
-      "invalid_auth": "That code didn't work, or this login can't see the system.",
-      "no_rooms": "No rooms were found for this system ID."
+      "invalid_auth": "That code wasn't accepted. Check it and try again.",
+      "no_rooms": "No rooms were found for this system ID.",
+      "invalid_system": "Quilt accepted the code, but this login can't read that system ID. Check the ID and try again (no new code needed)."
     },
     "abort": {
       "already_configured": "This Quilt system is already set up.",

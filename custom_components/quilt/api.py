@@ -73,6 +73,11 @@ _COGNITO_URL = f"https://cognito-idp.{REGION}.amazonaws.com/"
 class QuiltAuthError(Exception):
     """Raised when Cognito auth fails (bad/expired/revoked token or code)."""
 
+    def __init__(self, *args: object, session: str | None = None) -> None:
+        super().__init__(*args)
+        # After a wrong code Cognito answers with a new session for the next try.
+        self.session = session
+
 
 def is_revoked(err: Exception) -> bool:
     """True when the refresh token itself was rejected (the user must log in again)."""
@@ -134,7 +139,10 @@ def _looks_text(bs: bytes) -> bool:
         s = bs.decode("utf-8")
     except UnicodeDecodeError:
         return False
-    return len(s) > 0 and all(31 < ord(c) < 127 or c in "\t\n\r" for c in s)
+    # A leading \n, \t or \r is a field-1 tag (e.g. an id-only Meta, b"\n$<uuid>"),
+    # never the start of a Quilt name or id, so read those as messages.
+    return (len(s) > 0 and s[0] not in "\t\n\r"
+            and all(31 < ord(c) < 127 or c in "\t\n\r" for c in s))
 
 
 def _decode(buf: bytes) -> dict:
@@ -268,6 +276,40 @@ def _raw_field(buf: bytes, field: int) -> bytes | None:
     return None
 
 
+def _fixed32_float(raw: bytes) -> float | None:
+    return _finite(struct.unpack("<f", raw)[0]) if len(raw) == 4 else None
+
+
+def parse_energy(raw: bytes) -> dict[str, list[tuple[int, float]]]:
+    """Decode a GetEnergyMetricsResponse by wire type (no text-vs-message guessing).
+
+    {1: repeated SpaceEnergyMetrics {1: space_id, 3: repeated bucket
+    {1: Timestamp start, 2: status, 3: float kWh}}}.
+    """
+    out: dict[str, list[tuple[int, float]]] = {}
+    for f, wt, metrics in _iter_fields(raw):
+        if f != 1 or wt != 2:
+            continue
+        space_id, buckets = None, []
+        for mf, mwt, val in _iter_fields(metrics):
+            if mf == 1 and mwt == 2:
+                space_id = val.decode("utf-8", "replace")
+            elif mf == 3 and mwt == 2:
+                start = kwh = None
+                for bf, bwt, bval in _iter_fields(val):
+                    if bf == 1 and bwt == 2:
+                        for tf, twt, tval in _iter_fields(bval):
+                            if tf == 1 and twt == 0:
+                                start = tval
+                    elif bf == 3 and bwt == 5:
+                        kwh = _fixed32_float(bval)
+                if start is not None and kwh is not None:
+                    buckets.append((start, kwh))
+        if space_id:
+            out[space_id] = buckets
+    return out
+
+
 # ----------------------------------------------------------------------------
 # Passwordless email-code login (used by the config flow to mint a refresh token)
 # ----------------------------------------------------------------------------
@@ -295,7 +337,7 @@ def complete_email_login(session: str, username: str, code: str, *,
     )
     ar = res.get("AuthenticationResult")
     if not ar or "RefreshToken" not in ar:
-        raise QuiltAuthError(f"login failed: {json.dumps(res)[:300]}")
+        raise QuiltAuthError("that code wasn't accepted", session=res.get("Session"))
     return ar["RefreshToken"]
 
 
@@ -464,34 +506,23 @@ class QuiltClient:
 
         return {"rooms": rooms, "dial": dial}
 
-    def get_energy_today(self, since: float, until: float) -> dict[str, float]:
-        """kWh per room since `since` (epoch s), from Quilt's hourly energy buckets.
+    def get_energy(self, since: float, until: float) -> dict[str, list[tuple[int, float]]]:
+        """Quilt's hourly energy buckets per room: {space_id: [(start epoch s, kWh), ...]}.
 
         The bucket for the current hour is marked incomplete and grows until
-        the hour ends; it is included so the total tracks the day as it goes.
+        the hour ends; it is included so a day's total tracks the day as it goes.
         """
         req = (_len_delimited(1, self._system_id.encode())
                + _len_delimited(2, _timestamp(int(since)))
                + _len_delimited(3, _timestamp(int(until)))
                + b"\x20\x01")  # preferred_resolution = HOURLY
         raw = self._raw_energy(req, metadata=self._meta(), timeout=20)
-        totals: dict[str, float] = {}
-        for metrics in _decode(raw).get(1, []):
-            if not isinstance(metrics, dict):
-                continue
-            space_id = _first(metrics, 1)
-            if not isinstance(space_id, str):
-                continue
-            total = 0.0
-            for bucket in metrics.get(3, []):
-                if not isinstance(bucket, dict):
-                    continue
-                start = _first(bucket, 1, 1)
-                kwh = _finite(_first(bucket, 3))
-                if isinstance(start, int) and start >= since and kwh is not None:
-                    total += kwh
-            totals[space_id] = total
-        return totals
+        return parse_energy(raw)
+
+    def get_energy_today(self, since: float, until: float) -> dict[str, float]:
+        """kWh per room from `since` (epoch s) on."""
+        return {sid: sum(k for start, k in buckets if start >= since)
+                for sid, buckets in self.get_energy(since, until).items()}
 
     def _fresh_room(self, room_id: str) -> dict:
         for room in self.get_rooms():
@@ -510,6 +541,20 @@ class QuiltClient:
                 cool_setpoint=cool, heat_setpoint2=heat, f8=2,
                 comfort_id=comfort_id, updated=_now_ts()),
         )
+
+    @staticmethod
+    def current_writable_mode(room: dict) -> int | None:
+        """The room's current mode as one we may write, or None if it is off.
+
+        Quilt's own FALLBACK_AUTO is shown as Heat/Cool, so that is what we keep.
+        """
+        if not room["on"]:
+            return None
+        if room["mode"] in KNOWN_MODES:
+            return room["mode"]
+        if room["mode"] == MODE_FALLBACK_AUTO:
+            return MODE_HEAT_COOL
+        return None
 
     @staticmethod
     def resume_mode(room: dict) -> int:
@@ -542,10 +587,8 @@ class QuiltClient:
             raise QuiltAuthError(f"no {preset_name} preset for {room['name']}")
         if preset_name.lower() == "off":
             mode = MODE_OFF
-        elif room["on"] and room["mode"] in KNOWN_MODES:
-            mode = room["mode"]
         else:
-            mode = self.resume_mode(room)
+            mode = self.current_writable_mode(room) or self.resume_mode(room)
         upd = self._space_update(room, mode=mode, heat=preset["heat"], cool=preset["cool"],
                                  comfort_id=preset["id"])
         self._stub.UpdateSpace(pb.UpdateSpaceRequest(update=upd),
@@ -566,9 +609,13 @@ class QuiltClient:
             raise QuiltAuthError(f"no Active preset for {room['name']}")
         if mode is not None and (mode not in KNOWN_MODES or mode == MODE_OFF):
             raise ValueError(f"not an active Quilt mode: {mode}")
-        apply = mode is not None or room["on"]
         if mode is None:
-            mode = room["mode"] if room["on"] else MODE_OFF
+            mode = self.current_writable_mode(room)
+            if mode is None and room["on"]:  # an unknown mode we can't write back
+                mode = self.resume_mode(room)
+        apply = mode is not None
+        if mode is None:
+            mode = MODE_OFF
         new_heat = heat if heat is not None else ap["heat"]
         new_cool = cool if cool is not None else ap["cool"]
 
@@ -730,11 +777,14 @@ class NotifierStream:
 
     def __init__(self, auth: CognitoAuth, topics: Callable[[], list[str]],
                  on_events: Callable[[list[dict]], None],
-                 on_connect: Callable[[], None]) -> None:
+                 on_connect: Callable[[], None],
+                 on_disconnect: Callable[[], None] | None = None) -> None:
         self._auth = auth
         self._topics = topics
         self._on_events = on_events
         self._on_connect = on_connect
+        # Called when a connected stream ends, so availability can be re-checked.
+        self._on_disconnect = on_disconnect
         self._stop = threading.Event()
         self._call = None
         self._subscribed: frozenset[str] = frozenset()
@@ -879,8 +929,14 @@ class NotifierStream:
                 self._error_logged = True
         finally:
             done.set()
-            self._connected = False
             self._call = None
+            if self._connected:
+                self._connected = False
+                if self._on_disconnect is not None:
+                    try:
+                        self._on_disconnect()
+                    except Exception:  # noqa: BLE001 - never let a callback kill the thread
+                        _LOGGER.debug("Quilt notifier disconnect callback failed", exc_info=True)
             if call is not None:
                 call.cancel()
             channel.close()

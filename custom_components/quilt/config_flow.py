@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import timedelta
 from typing import Any
 import urllib.error
 
@@ -61,13 +62,29 @@ class QuiltConfigFlow(ConfigFlow, domain=DOMAIN):
         self._email: str | None = None
         self._session: str | None = None
         self._username: str | None = None
+        # A login Cognito already issued; Cognito sessions are single-use, so a
+        # retry after a bad system ID must not answer the code again.
+        self._refresh: str | None = None
+
+    async def _login(self, code: str) -> str:
+        """Answer the emailed code once; keep Cognito's next session if it's rejected."""
+        if self._refresh is None:
+            try:
+                self._refresh = await self.hass.async_add_executor_job(
+                    api.complete_email_login, self._session, self._username, code
+                )
+            except api.QuiltAuthError as err:
+                if err.session:
+                    self._session = err.session
+                raise
+        return self._refresh
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
-            self._email = user_input[CONF_EMAIL]
+            self._email = user_input[CONF_EMAIL].strip()
             try:
                 self._session, self._username = await self.hass.async_add_executor_job(
                     api.begin_email_login, self._email
@@ -91,13 +108,13 @@ class QuiltConfigFlow(ConfigFlow, domain=DOMAIN):
             code = user_input["code"].strip()
             system_id = user_input[CONF_SYSTEM_ID].strip()
             try:
-                refresh = await self.hass.async_add_executor_job(
-                    api.complete_email_login, self._session, self._username, code
-                )
+                refresh = await self._login(code)
                 # Validate the credentials by reading the system once.
                 rooms = await _validate(self.hass, refresh, system_id)
-            except (api.QuiltAuthError, grpc.RpcError):
+            except api.QuiltAuthError:
                 errors["base"] = "invalid_auth"
+            except grpc.RpcError:
+                errors["base"] = "invalid_system"
             except _UNREACHABLE:
                 errors["base"] = "cannot_connect"
             else:
@@ -147,6 +164,7 @@ class QuiltConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "cannot_connect"
             else:
                 self._email = email
+                self._refresh = None
                 return await self.async_step_reauth_code()
         return self.async_show_form(
             step_id="reauth_confirm",
@@ -163,15 +181,12 @@ class QuiltConfigFlow(ConfigFlow, domain=DOMAIN):
         entry = self._get_reauth_entry()
         if user_input is not None:
             try:
-                refresh = await self.hass.async_add_executor_job(
-                    api.complete_email_login,
-                    self._session,
-                    self._username,
-                    user_input["code"].strip(),
-                )
+                refresh = await self._login(user_input["code"].strip())
                 rooms = await _validate(self.hass, refresh, entry.data[CONF_SYSTEM_ID])
-            except (api.QuiltAuthError, grpc.RpcError):
+            except api.QuiltAuthError:
                 errors["base"] = "invalid_auth"
+            except grpc.RpcError:
+                errors["base"] = "invalid_system"
             except _UNREACHABLE:
                 errors["base"] = "cannot_connect"
             else:
@@ -197,9 +212,14 @@ class QuiltOptionsFlow(OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         if user_input is not None:
-            return self.async_create_entry(
-                data={CONF_SCAN_INTERVAL: int(user_input[CONF_SCAN_INTERVAL])}
-            )
+            seconds = int(user_input[CONF_SCAN_INTERVAL])
+            # Applied in place (no reload, and no update listener: one would also
+            # fire on a reauth's data change and poll with the revoked login).
+            coordinator = getattr(self.config_entry, "runtime_data", None)
+            if coordinator is not None:
+                coordinator.update_interval = timedelta(seconds=seconds)
+                await coordinator.async_request_refresh()
+            return self.async_create_entry(data={CONF_SCAN_INTERVAL: seconds})
         current = self.config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
         return self.async_show_form(
             step_id="init",
