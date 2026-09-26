@@ -16,21 +16,19 @@ from homeassistant.components.climate import (
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ServiceValidationError
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_call_later
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import api
 from .const import (
     COOL_MAX,
     COOL_MIN,
-    DOMAIN,
     HEAT_MAX,
     HEAT_MIN,
     WRITE_HOLD_SECONDS,
 )
 from .coordinator import QuiltCoordinator
+from .entity import QuiltEntity, room_device
 
 QUILT_TO_HA = {
     api.MODE_OFF: HVACMode.OFF,
@@ -41,6 +39,27 @@ QUILT_TO_HA = {
     api.MODE_DRY: HVACMode.DRY,
 }
 HA_TO_QUILT = {ha: quilt for quilt, ha in QUILT_TO_HA.items()}
+# Read-only: fallback modes Quilt can pick itself; we never write them.
+QUILT_TO_HA[api.MODE_FALLBACK_AUTO] = HVACMode.HEAT_COOL
+QUILT_TO_HA[api.MODE_FALLBACK_OFF] = HVACMode.OFF
+
+# What the unit itself reports it is doing (Space.state f4). "Deferred" means it
+# is waiting out a mode-switch delay, so it isn't conditioning yet.
+HVAC_STATE_TO_ACTION = {
+    api.HVAC_STATE_STANDBY: HVACAction.IDLE,
+    api.HVAC_STATE_COOL: HVACAction.COOLING,
+    api.HVAC_STATE_HEAT: HVACAction.HEATING,
+    api.HVAC_STATE_DRIFT: HVACAction.IDLE,
+    api.HVAC_STATE_FAN: HVACAction.FAN,
+    api.HVAC_STATE_COOL_DEFERRED: HVACAction.IDLE,
+    api.HVAC_STATE_HEAT_DEFERRED: HVACAction.IDLE,
+    api.HVAC_STATE_FAN_DEFERRED: HVACAction.IDLE,
+    api.HVAC_STATE_COOL_PREPARING: HVACAction.COOLING,
+    api.HVAC_STATE_HEAT_PREPARING: HVACAction.PREHEATING,
+    api.HVAC_STATE_DRY: HVACAction.DRYING,
+    api.HVAC_STATE_DRY_DEFERRED: HVACAction.IDLE,
+    api.HVAC_STATE_DRY_PREPARING: HVACAction.DRYING,
+}
 
 
 async def async_setup_entry(
@@ -53,10 +72,9 @@ async def async_setup_entry(
     )
 
 
-class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
+class QuiltClimate(QuiltEntity, ClimateEntity):
     """A Quilt room exposed as a thermostat with Quilt's own modes."""
 
-    _attr_has_entity_name = True
     _attr_name = None
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_hvac_modes = [
@@ -97,12 +115,7 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
         self._attr_preset_modes = [
             name for name in self.room.get("presets", {}) if name.lower() != "off"
         ]
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, room_id)},
-            name=self.room.get("name"),
-            manufacturer="Quilt",
-            model="Heat Pump",
-        )
+        self._attr_device_info = room_device(coordinator, room_id)
 
     # --- helpers ---------------------------------------------------------
     @property
@@ -185,6 +198,11 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
         mode = self.hvac_mode
         if mode == HVACMode.OFF or not self.room["on"]:
             return HVACAction.OFF
+        # Prefer what the unit reports; right after one of our own writes the
+        # optimistic mode may be ahead of it, so fall back to the estimate then.
+        reported = HVAC_STATE_TO_ACTION.get(self.room.get("hvac_state"))
+        if reported is not None and not self._optimistic:
+            return reported
         if mode is None:
             return HVACAction.IDLE
         if mode == HVACMode.FAN_ONLY:
@@ -238,12 +256,17 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
         return min(max(self._desired_heat, HEAT_MIN), HEAT_MAX)
 
     # --- commands --------------------------------------------------------
+    def _preset_id(self, name: str) -> dict:
+        """active_comfort_id for the optimistic state after a write that applies `name`."""
+        preset = self.room.get("presets", {}).get(name)
+        return {"active_comfort_id": preset["id"]} if preset else {}
+
     async def _write_mode(self, hvac_mode: HVACMode) -> None:
         if hvac_mode == HVACMode.OFF:
             mode = await self._write(
                 lambda: self.coordinator.client.set_active(self._room_id, False)
             )
-            await self._applied(mode)
+            await self._applied(mode, **self._preset_id("Off"))
             return
         self._clamp(hvac_mode)
         heat, cool = self._desired_heat, self._desired_cool
@@ -252,7 +275,7 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
                 self._room_id, heat=heat, cool=cool, mode=HA_TO_QUILT[hvac_mode]
             )
         )
-        await self._applied(mode, heat_setpoint=heat, cool_setpoint=cool)
+        await self._applied(mode, heat_setpoint=heat, cool_setpoint=cool, **self._preset_id("Active"))
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         await self._write_mode(hvac_mode)
@@ -281,7 +304,8 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
         written = await self._write(
             lambda: self.coordinator.client.set_setpoints(self._room_id, heat=heat, cool=cool)
         )
-        await self._applied(written, heat_setpoint=heat, cool_setpoint=cool)
+        applied = self._preset_id("Active") if written != api.MODE_OFF else {}
+        await self._applied(written, heat_setpoint=heat, cool_setpoint=cool, **applied)
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         mode = await self._write(
@@ -294,7 +318,9 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
         await self._write_mode(HVACMode.OFF)
 
     async def async_turn_on(self) -> None:
+        if self.room["on"]:
+            return  # already on: keep its mode and preset (e.g. Sleep or Eco)
         mode = await self._write(
             lambda: self.coordinator.client.set_active(self._room_id, True)
         )
-        await self._applied(mode)
+        await self._applied(mode, **self._preset_id("Active"))

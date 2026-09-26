@@ -31,14 +31,36 @@ CLIENT_ID = "6lef74vtc8p7pgu47nmqubd9vn"
 USER_POOL_ID = "us-west-2_mP0zkCEzn"
 GRPC_HOST = "api.prod.quilt.cloud:443"
 
-# Space.control.mode is the room's HVAC mode. Codes 6 and 7 have not been seen.
+# Space.control.mode is the room's HVAC mode.
 MODE_OFF = 1
 MODE_COOL = 2
 MODE_HEAT = 3
 MODE_HEAT_COOL = 4
 MODE_FAN = 5
 MODE_DRY = 8
+# The modes we write. Quilt can also report 6 and 7, fallbacks it picks on its
+# own (named FALLBACK_AUTO / FALLBACK_OFF in the Android app); we only read them.
 KNOWN_MODES = frozenset({MODE_OFF, MODE_COOL, MODE_HEAT, MODE_HEAT_COOL, MODE_FAN, MODE_DRY})
+MODE_FALLBACK_AUTO = 6
+MODE_FALLBACK_OFF = 7
+OFF_MODES = frozenset({MODE_OFF, MODE_FALLBACK_OFF})
+
+# Space.state field 4 (our proto calls it SpaceSensor.valid): what the unit is
+# doing right now, as reported by the unit. Values from the Android app's
+# HVACState enum; verified live that a cooling room reports 2 and an off room 1.
+HVAC_STATE_STANDBY = 1
+HVAC_STATE_COOL = 2
+HVAC_STATE_HEAT = 3
+HVAC_STATE_DRIFT = 4
+HVAC_STATE_FAN = 5
+HVAC_STATE_COOL_DEFERRED = 6
+HVAC_STATE_HEAT_DEFERRED = 7
+HVAC_STATE_FAN_DEFERRED = 8
+HVAC_STATE_COOL_PREPARING = 9
+HVAC_STATE_HEAT_PREPARING = 10
+HVAC_STATE_DRY = 11
+HVAC_STATE_DRY_DEFERRED = 12
+HVAC_STATE_DRY_PREPARING = 13
 
 # Quilt "Off" preset sentinels: a very low heat / very high cool threshold
 # disables that side, which is how we express heat-only / cool-only.
@@ -50,6 +72,11 @@ _COGNITO_URL = f"https://cognito-idp.{REGION}.amazonaws.com/"
 
 class QuiltAuthError(Exception):
     """Raised when Cognito auth fails (bad/expired/revoked token or code)."""
+
+    def __init__(self, *args: object, session: str | None = None) -> None:
+        super().__init__(*args)
+        # After a wrong code Cognito answers with a new session for the next try.
+        self.session = session
 
 
 def is_revoked(err: Exception) -> bool:
@@ -112,7 +139,10 @@ def _looks_text(bs: bytes) -> bool:
         s = bs.decode("utf-8")
     except UnicodeDecodeError:
         return False
-    return len(s) > 0 and all(31 < ord(c) < 127 or c in "\t\n\r" for c in s)
+    # A leading \n, \t or \r is a field-1 tag (e.g. an id-only Meta, b"\n$<uuid>"),
+    # never the start of a Quilt name or id, so read those as messages.
+    return (len(s) > 0 and s[0] not in "\t\n\r"
+            and all(31 < ord(c) < 127 or c in "\t\n\r" for c in s))
 
 
 def _decode(buf: bytes) -> dict:
@@ -166,7 +196,7 @@ def _space_state(s) -> dict:
     state: dict = {}
     if s.HasField("control"):
         state["mode"] = s.control.mode
-        state["on"] = s.control.mode != MODE_OFF
+        state["on"] = s.control.mode not in OFF_MODES
         state["active_comfort_id"] = s.control.comfort_id
         # Field 5 holds the heat setpoint in every mode; field 2 tracks
         # whichever setpoint the current mode targets.
@@ -180,6 +210,8 @@ def _space_state(s) -> dict:
         temp = _finite(s.sensor.current_temp)
         if temp is not None:
             state["current_temp"] = temp
+        if s.sensor.valid:  # 0 = not reported
+            state["hvac_state"] = s.sensor.valid
     return state
 
 
@@ -193,6 +225,25 @@ def _unit_state(unit: dict) -> tuple[str | None, dict]:
     if hum is not None:
         state["humidity"] = round(hum)
     return _first(unit, 2, 2), state  # first ref = space id
+
+
+def _dial_state(dial: dict) -> dict:
+    """Live fields of the Dial (controller) from a full read or a push.
+
+    Its field 4 block holds the room temperature the Dial reports (f5, °C) and
+    unidentified channels f8-f10. f3 is not humidity: over four days it tracked
+    temperature (r=+0.85) and ran opposite to room humidity, matching the
+    Android app's "PCB temperature" label, so it isn't exposed.
+    """
+    state: dict = {}
+    for key, field in (("temperature", 5), ("ambient_1", 8),
+                       ("ambient_2", 9), ("ambient_3", 10)):
+        value = _first(dial, 4, field)
+        if isinstance(value, float):
+            value = _finite(value)
+        if isinstance(value, (int, float)):
+            state[key] = value
+    return state
 
 
 def _iter_fields(buf: bytes):
@@ -225,6 +276,40 @@ def _raw_field(buf: bytes, field: int) -> bytes | None:
     return None
 
 
+def _fixed32_float(raw: bytes) -> float | None:
+    return _finite(struct.unpack("<f", raw)[0]) if len(raw) == 4 else None
+
+
+def parse_energy(raw: bytes) -> dict[str, list[tuple[int, float]]]:
+    """Decode a GetEnergyMetricsResponse by wire type (no text-vs-message guessing).
+
+    {1: repeated SpaceEnergyMetrics {1: space_id, 3: repeated bucket
+    {1: Timestamp start, 2: status, 3: float kWh}}}.
+    """
+    out: dict[str, list[tuple[int, float]]] = {}
+    for f, wt, metrics in _iter_fields(raw):
+        if f != 1 or wt != 2:
+            continue
+        space_id, buckets = None, []
+        for mf, mwt, val in _iter_fields(metrics):
+            if mf == 1 and mwt == 2:
+                space_id = val.decode("utf-8", "replace")
+            elif mf == 3 and mwt == 2:
+                start = kwh = None
+                for bf, bwt, bval in _iter_fields(val):
+                    if bf == 1 and bwt == 2:
+                        for tf, twt, tval in _iter_fields(bval):
+                            if tf == 1 and twt == 0:
+                                start = tval
+                    elif bf == 3 and bwt == 5:
+                        kwh = _fixed32_float(bval)
+                if start is not None and kwh is not None:
+                    buckets.append((start, kwh))
+        if space_id:
+            out[space_id] = buckets
+    return out
+
+
 # ----------------------------------------------------------------------------
 # Passwordless email-code login (used by the config flow to mint a refresh token)
 # ----------------------------------------------------------------------------
@@ -252,7 +337,7 @@ def complete_email_login(session: str, username: str, code: str, *,
     )
     ar = res.get("AuthenticationResult")
     if not ar or "RefreshToken" not in ar:
-        raise QuiltAuthError(f"login failed: {json.dumps(res)[:300]}")
+        raise QuiltAuthError("that code wasn't accepted", session=res.get("Session"))
     return ar["RefreshToken"]
 
 
@@ -307,6 +392,13 @@ class QuiltClient:
             request_serializer=lambda b: b,
             response_deserializer=lambda b: b,
         )
+        # Hand-encoded like the notifier, so no second generated proto (and no
+        # descriptor-pool name clashes) is needed.
+        self._raw_energy = self._channel.unary_unary(
+            "/core.protos.app.SystemInformationService/GetEnergyMetrics",
+            request_serializer=lambda b: b,
+            response_deserializer=lambda b: b,
+        )
 
     def close(self) -> None:
         self._channel.close()
@@ -337,8 +429,12 @@ class QuiltClient:
 
         rooms = []
         for s in home.spaces:
-            if not s.HasField("info") or s.info.space_type != 2:
-                continue  # only rooms
+            # Rooms are the spaces under the home. SpaceSettings f5 (our
+            # "space_type") is 2 for every room only because auto-away is on;
+            # the Android app names it the occupancy mode, so switching
+            # auto-away off would have hidden the room.
+            if not s.HasField("parent") or not s.parent.parent_id:
+                continue
             presets = {}
             for c in comfort_by_space.get(s.meta.id, []):
                 presets[c.value.name] = {
@@ -397,19 +493,36 @@ class QuiltClient:
         dial = None
         draw = (extras.get(11) or [None])[0]
         if isinstance(draw, dict):
-            try:
-                dial = {
-                    "name": _first(draw, 3, 1) or "Quilt Dial",
-                    "temperature": _first(draw, 4, 5),
-                    "humidity": _first(draw, 4, 3),
-                    "ambient_1": _first(draw, 4, 8),
-                    "ambient_2": _first(draw, 4, 9),
-                    "ambient_3": _first(draw, 4, 10),
-                }
-            except (TypeError, ValueError, IndexError):
-                dial = None
+            name = _first(draw, 3, 1)
+            dial = {
+                "id": _first(draw, 1, 1),
+                "name": name if isinstance(name, str) else "Quilt Dial",
+                "temperature": None,
+                "ambient_1": None,
+                "ambient_2": None,
+                "ambient_3": None,
+                **_dial_state(draw),
+            }
 
         return {"rooms": rooms, "dial": dial}
+
+    def get_energy(self, since: float, until: float) -> dict[str, list[tuple[int, float]]]:
+        """Quilt's hourly energy buckets per room: {space_id: [(start epoch s, kWh), ...]}.
+
+        The bucket for the current hour is marked incomplete and grows until
+        the hour ends; it is included so a day's total tracks the day as it goes.
+        """
+        req = (_len_delimited(1, self._system_id.encode())
+               + _len_delimited(2, _timestamp(int(since)))
+               + _len_delimited(3, _timestamp(int(until)))
+               + b"\x20\x01")  # preferred_resolution = HOURLY
+        raw = self._raw_energy(req, metadata=self._meta(), timeout=20)
+        return parse_energy(raw)
+
+    def get_energy_today(self, since: float, until: float) -> dict[str, float]:
+        """kWh per room from `since` (epoch s) on."""
+        return {sid: sum(k for start, k in buckets if start >= since)
+                for sid, buckets in self.get_energy(since, until).items()}
 
     def _fresh_room(self, room_id: str) -> dict:
         for room in self.get_rooms():
@@ -428,6 +541,20 @@ class QuiltClient:
                 cool_setpoint=cool, heat_setpoint2=heat, f8=2,
                 comfort_id=comfort_id, updated=_now_ts()),
         )
+
+    @staticmethod
+    def current_writable_mode(room: dict) -> int | None:
+        """The room's current mode as one we may write, or None if it is off.
+
+        Quilt's own FALLBACK_AUTO is shown as Heat/Cool, so that is what we keep.
+        """
+        if not room["on"]:
+            return None
+        if room["mode"] in KNOWN_MODES:
+            return room["mode"]
+        if room["mode"] == MODE_FALLBACK_AUTO:
+            return MODE_HEAT_COOL
+        return None
 
     @staticmethod
     def resume_mode(room: dict) -> int:
@@ -460,10 +587,8 @@ class QuiltClient:
             raise QuiltAuthError(f"no {preset_name} preset for {room['name']}")
         if preset_name.lower() == "off":
             mode = MODE_OFF
-        elif room["on"] and room["mode"] in KNOWN_MODES:
-            mode = room["mode"]
         else:
-            mode = self.resume_mode(room)
+            mode = self.current_writable_mode(room) or self.resume_mode(room)
         upd = self._space_update(room, mode=mode, heat=preset["heat"], cool=preset["cool"],
                                  comfort_id=preset["id"])
         self._stub.UpdateSpace(pb.UpdateSpaceRequest(update=upd),
@@ -484,9 +609,13 @@ class QuiltClient:
             raise QuiltAuthError(f"no Active preset for {room['name']}")
         if mode is not None and (mode not in KNOWN_MODES or mode == MODE_OFF):
             raise ValueError(f"not an active Quilt mode: {mode}")
-        apply = mode is not None or room["on"]
         if mode is None:
-            mode = room["mode"] if room["on"] else MODE_OFF
+            mode = self.current_writable_mode(room)
+            if mode is None and room["on"]:  # an unknown mode we can't write back
+                mode = self.resume_mode(room)
+        apply = mode is not None
+        if mode is None:
+            mode = MODE_OFF
         new_heat = heat if heat is not None else ap["heat"]
         new_cool = cool if cool is not None else ap["cool"]
 
@@ -570,6 +699,11 @@ def _len_delimited(field: int, payload: bytes) -> bytes:
     return _varint((field << 3) | 2) + _varint(len(payload)) + payload
 
 
+def _timestamp(seconds: int) -> bytes:
+    """google.protobuf.Timestamp{seconds}."""
+    return b"\x08" + _varint(seconds)
+
+
 def subscribe_request(topics: list[str]) -> bytes:
     """SubscribeRequest{append: {subscriptions: [{topic}, ...]}}."""
     subs = b"".join(_len_delimited(1, _len_delimited(1, t.encode())) for t in topics)
@@ -580,8 +714,9 @@ def parse_notifier_frame(raw: bytes) -> list[dict]:
     """Decode one Subscribe response into events.
 
     Returns dicts of kind "space" (space_id + _space_state fields), "unit"
-    (space_id + _unit_state fields) or "control" (type + topics). Heartbeats
-    and anything unrecognised yield nothing.
+    (space_id, unit_id + _unit_state fields), "dial" (dial_id + _dial_state
+    fields) or "control" (type + topics). Heartbeats and anything
+    unrecognised yield nothing.
     """
     events: list[dict] = []
     try:
@@ -612,10 +747,19 @@ def _data_events(event: bytes) -> list[dict]:
     obj = pb.HomeDatastoreSystem.FromString(diff)
     for s in obj.spaces:
         events.append({"kind": "space", "space_id": s.meta.id, **_space_state(s)})
-    for unit in _decode(diff).get(9, []):
+    decoded = _decode(diff)
+    for unit in decoded.get(9, []):
+        if not isinstance(unit, dict):
+            continue
         space_id, state = _unit_state(unit)
-        if space_id:
-            events.append({"kind": "unit", "space_id": space_id, **state})
+        # Diffs have always carried the room link so far; the unit id lets the
+        # coordinator place one that doesn't.
+        unit_id = _first(unit, 1, 1)
+        if space_id or unit_id:
+            events.append({"kind": "unit", "space_id": space_id, "unit_id": unit_id, **state})
+    for dial in decoded.get(11, []):
+        if isinstance(dial, dict):
+            events.append({"kind": "dial", "dial_id": _first(dial, 1, 1), **_dial_state(dial)})
     return events
 
 
@@ -633,18 +777,28 @@ class NotifierStream:
 
     def __init__(self, auth: CognitoAuth, topics: Callable[[], list[str]],
                  on_events: Callable[[list[dict]], None],
-                 on_connect: Callable[[], None]) -> None:
+                 on_connect: Callable[[], None],
+                 on_disconnect: Callable[[], None] | None = None) -> None:
         self._auth = auth
         self._topics = topics
         self._on_events = on_events
         self._on_connect = on_connect
+        # Called when a connected stream ends, so availability can be re-checked.
+        self._on_disconnect = on_disconnect
         self._stop = threading.Event()
         self._call = None
         self._subscribed: frozenset[str] = frozenset()
         self._last_frame = 0.0
+        self._connected = False
         self._auth_warned = False
+        self._error_logged = False
         self._revoked = False
         self._thread: threading.Thread | None = None
+
+    @property
+    def healthy(self) -> bool:
+        """Subscribed and hearing from Quilt (it sends something every few seconds)."""
+        return self._connected and time.monotonic() - self._last_frame < self.SILENCE_TIMEOUT
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="quilt-notifier", daemon=True)
@@ -668,7 +822,13 @@ class NotifierStream:
         backoff = 1.0
         while not self._stop.is_set():
             started = time.monotonic()
-            connected = self._stream_once()
+            try:
+                connected = self._stream_once()
+            except Exception:  # noqa: BLE001 - the thread must outlive any one failure
+                connected = False
+                if not self._error_logged:
+                    _LOGGER.exception("Quilt notifier failed; retrying")
+                    self._error_logged = True
             if self._stop.is_set():
                 break
             if self._revoked:
@@ -697,6 +857,11 @@ class NotifierStream:
             return False
         except (urllib.error.URLError, OSError) as err:
             _LOGGER.debug("Quilt notifier can't reach Cognito: %s", err)
+            return False
+        except Exception as err:  # noqa: BLE001 - e.g. a truncated or non-JSON reply
+            if not self._auth_warned:
+                _LOGGER.warning("Quilt notifier can't refresh its login; retrying: %r", err)
+                self._auth_warned = True
             return False
         self._auth_warned = False
         if self._stop.is_set():
@@ -746,7 +911,8 @@ class NotifierStream:
                                         ev["type"], ev["topics"])
                     if not connected and (ev["kind"] != "control"
                                           or ev["type"] == CONTROL_TOPIC_APPENDED):
-                        connected = True
+                        connected = self._connected = True
+                        self._error_logged = False
                         _LOGGER.debug("Quilt notifier subscribed to %d topics", len(topics))
                         self._on_connect()
                 if data:
@@ -758,10 +924,19 @@ class NotifierStream:
             if not self._stop.is_set():
                 _LOGGER.debug("Quilt notifier stream ended: %s", err.code())
         except Exception:  # noqa: BLE001 - keep the thread alive; the poll still runs
-            _LOGGER.exception("Quilt notifier stream failed")
+            if not self._error_logged:
+                _LOGGER.exception("Quilt notifier stream failed")
+                self._error_logged = True
         finally:
             done.set()
             self._call = None
+            if self._connected:
+                self._connected = False
+                if self._on_disconnect is not None:
+                    try:
+                        self._on_disconnect()
+                    except Exception:  # noqa: BLE001 - never let a callback kill the thread
+                        _LOGGER.debug("Quilt notifier disconnect callback failed", exc_info=True)
             if call is not None:
                 call.cancel()
             channel.close()

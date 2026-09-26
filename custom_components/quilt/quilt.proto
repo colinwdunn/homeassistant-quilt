@@ -18,9 +18,9 @@ message GetHomeDatastoreSystemRequest {
 }
 
 message HomeDatastoreSystem {
-  repeated Space spaces = 3;             // element with info.space_type==2 are rooms
+  repeated Space spaces = 3;             // rooms are the spaces with a parent (the home has none)
   repeated ComfortSetting comfort_settings = 13;
-  // other repeated collections (dials=7, indoor units=8, zones=9, ...) ignored
+  // read from raw bytes in api.py: indoor units = 9, the Dial (controller) = 11
 }
 
 message Meta {
@@ -38,7 +38,7 @@ message SpaceInfo {
   string name = 1;                       // "Primary Bedroom", "Living Room", ...
   Timestamp updated = 3;
   string timezone = 4;
-  uint32 space_type = 5;                 // 0 = building, 2 = room
+  uint32 space_type = 5;                 // occupancy (auto-away) mode per the Android app; not a room marker
 }
 
 message SpaceControl {
@@ -54,9 +54,9 @@ message SpaceControl {
 
 message SpaceSensor {
   Timestamp ts = 1;
-  float humidity = 2;
+  float humidity = 2;                    // actually the current setpoint (°C); not humidity
   float current_temp = 3;                // °C  <-- room temperature
-  uint32 valid = 4;
+  uint32 valid = 4;                      // HVACState: what the unit is doing (see api.HVAC_STATE_*)
 }
 
 message Space {

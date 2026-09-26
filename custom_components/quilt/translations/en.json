@@ -15,15 +15,31 @@
           "code": "One-time code",
           "system_id": "Quilt system ID"
         }
+      },
+      "reauth_confirm": {
+        "title": "Sign in to Quilt again",
+        "description": "Quilt stopped accepting Home Assistant's login. Quilt will email a new one-time code to this address.",
+        "data": {
+          "email": "Quilt account email"
+        }
+      },
+      "reauth_code": {
+        "title": "Sign in to Quilt again",
+        "description": "Enter the code Quilt emailed to {email}.",
+        "data": {
+          "code": "One-time code"
+        }
       }
     },
     "error": {
       "cannot_connect": "Couldn't reach Quilt. Check the email address and try again.",
-      "invalid_auth": "That code didn't work, or the system ID is wrong.",
-      "no_rooms": "No rooms were found for this system ID."
+      "invalid_auth": "That code wasn't accepted. Check it and try again.",
+      "no_rooms": "No rooms were found for this system ID.",
+      "invalid_system": "Quilt accepted the code, but this login can't read that system ID. Check the ID and try again (no new code needed)."
     },
     "abort": {
-      "already_configured": "This Quilt system is already set up."
+      "already_configured": "This Quilt system is already set up.",
+      "reauth_successful": "Signed in to Quilt again."
     }
   },
   "options": {

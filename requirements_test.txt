@@ -1,0 +1,4 @@
+# Home Assistant test harness pinned to HA 2026.7.3 (the version this is deployed on).
+pytest-homeassistant-custom-component==0.13.347
+grpcio==1.78.0
+protobuf==6.32.0
