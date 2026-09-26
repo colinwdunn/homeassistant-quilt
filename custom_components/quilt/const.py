@@ -14,6 +14,8 @@ MIN_SCAN_INTERVAL = 10  # seconds
 MAX_SCAN_INTERVAL = 3600  # seconds
 # Shortest gap between on-demand refreshes (after writes and pushed changes).
 REFRESH_COOLDOWN = 2.0  # seconds
+# Quilt reports energy in hourly buckets; re-read today's total this often.
+ENERGY_REFRESH_INTERVAL = 900  # seconds
 
 # HVAC setpoint bounds (mirrors the Homebridge accessory clamps)
 HEAT_MIN = 8.0

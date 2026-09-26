@@ -4,7 +4,9 @@ from __future__ import annotations
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 
+from .const import DOMAIN
 from .coordinator import QuiltCoordinator, scan_interval
 
 PLATFORMS: list[Platform] = [
@@ -18,6 +20,7 @@ type QuiltConfigEntry = ConfigEntry[QuiltCoordinator]
 
 async def async_setup_entry(hass: HomeAssistant, entry: QuiltConfigEntry) -> bool:
     """Set up Quilt from a config entry."""
+    _remove_retired_entities(hass)
     coordinator = QuiltCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
@@ -30,6 +33,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: QuiltConfigEntry) -> boo
     if not hass.is_stopping:
         coordinator.start_push()
     return True
+
+
+def _remove_retired_entities(hass: HomeAssistant) -> None:
+    """Drop entities earlier versions created that turned out to be wrong."""
+    registry = er.async_get(hass)
+    # v0.2-0.4 "Dial humidity" was really a circuit-board temperature.
+    if entity_id := registry.async_get_entity_id("sensor", DOMAIN, "quilt_dial_humidity"):
+        registry.async_remove(entity_id)
 
 
 async def _async_options_updated(hass: HomeAssistant, entry: QuiltConfigEntry) -> None:

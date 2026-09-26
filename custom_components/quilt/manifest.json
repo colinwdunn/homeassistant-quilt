@@ -1,12 +1,16 @@
 {
   "domain": "quilt",
   "name": "Quilt",
-  "version": "0.4.0",
-  "documentation": "https://github.com/colinwdunn/homeassistant-quilt",
-  "issue_tracker": "https://github.com/colinwdunn/homeassistant-quilt/issues",
-  "codeowners": ["@colinwdunn"],
+  "codeowners": [
+    "@colinwdunn"
+  ],
   "config_flow": true,
-  "iot_class": "cloud_push",
+  "documentation": "https://github.com/colinwdunn/homeassistant-quilt",
   "integration_type": "hub",
-  "requirements": ["grpcio>=1.60.0"]
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/colinwdunn/homeassistant-quilt/issues",
+  "requirements": [
+    "grpcio>=1.60.0"
+  ],
+  "version": "0.5.0"
 }

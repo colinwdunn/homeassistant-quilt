@@ -19,7 +19,6 @@ from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_call_later
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import api
 from .const import (
@@ -31,6 +30,7 @@ from .const import (
     WRITE_HOLD_SECONDS,
 )
 from .coordinator import QuiltCoordinator
+from .entity import QuiltEntity
 
 QUILT_TO_HA = {
     api.MODE_OFF: HVACMode.OFF,
@@ -41,6 +41,27 @@ QUILT_TO_HA = {
     api.MODE_DRY: HVACMode.DRY,
 }
 HA_TO_QUILT = {ha: quilt for quilt, ha in QUILT_TO_HA.items()}
+# Read-only: fallback modes Quilt can pick itself; we never write them.
+QUILT_TO_HA[api.MODE_FALLBACK_AUTO] = HVACMode.HEAT_COOL
+QUILT_TO_HA[api.MODE_FALLBACK_OFF] = HVACMode.OFF
+
+# What the unit itself reports it is doing (Space.state f4). "Deferred" means it
+# is waiting out a mode-switch delay, so it isn't conditioning yet.
+HVAC_STATE_TO_ACTION = {
+    api.HVAC_STATE_STANDBY: HVACAction.IDLE,
+    api.HVAC_STATE_COOL: HVACAction.COOLING,
+    api.HVAC_STATE_HEAT: HVACAction.HEATING,
+    api.HVAC_STATE_DRIFT: HVACAction.IDLE,
+    api.HVAC_STATE_FAN: HVACAction.FAN,
+    api.HVAC_STATE_COOL_DEFERRED: HVACAction.IDLE,
+    api.HVAC_STATE_HEAT_DEFERRED: HVACAction.IDLE,
+    api.HVAC_STATE_FAN_DEFERRED: HVACAction.IDLE,
+    api.HVAC_STATE_COOL_PREPARING: HVACAction.COOLING,
+    api.HVAC_STATE_HEAT_PREPARING: HVACAction.PREHEATING,
+    api.HVAC_STATE_DRY: HVACAction.DRYING,
+    api.HVAC_STATE_DRY_DEFERRED: HVACAction.IDLE,
+    api.HVAC_STATE_DRY_PREPARING: HVACAction.DRYING,
+}
 
 
 async def async_setup_entry(
@@ -53,10 +74,9 @@ async def async_setup_entry(
     )
 
 
-class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
+class QuiltClimate(QuiltEntity, ClimateEntity):
     """A Quilt room exposed as a thermostat with Quilt's own modes."""
 
-    _attr_has_entity_name = True
     _attr_name = None
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_hvac_modes = [
@@ -185,6 +205,11 @@ class QuiltClimate(CoordinatorEntity[QuiltCoordinator], ClimateEntity):
         mode = self.hvac_mode
         if mode == HVACMode.OFF or not self.room["on"]:
             return HVACAction.OFF
+        # Prefer what the unit reports; right after one of our own writes the
+        # optimistic mode may be ahead of it, so fall back to the estimate then.
+        reported = HVAC_STATE_TO_ACTION.get(self.room.get("hvac_state"))
+        if reported is not None and not self._optimistic:
+            return reported
         if mode is None:
             return HVACAction.IDLE
         if mode == HVACMode.FAN_ONLY:

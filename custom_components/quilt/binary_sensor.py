@@ -13,10 +13,10 @@ from homeassistant.components.binary_sensor import (
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import QuiltCoordinator
+from .entity import QuiltEntity
 
 
 async def async_setup_entry(
@@ -31,10 +31,9 @@ async def async_setup_entry(
     )
 
 
-class QuiltOccupancy(CoordinatorEntity[QuiltCoordinator], BinarySensorEntity):
+class QuiltOccupancy(QuiltEntity, BinarySensorEntity):
     """Per-room presence as reported by the indoor head unit."""
 
-    _attr_has_entity_name = True
     _attr_name = "Occupancy"
     _attr_device_class = BinarySensorDeviceClass.OCCUPANCY
 
