@@ -69,3 +69,7 @@ meaning isn't confirmed yet.
 pip install -r requirements_test.txt
 pytest
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
